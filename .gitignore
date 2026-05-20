@@ -10,6 +10,7 @@ user-settings*.json
 pending-choices*.json
 incoming/
 crash-dumps/
+state-backups/
 npm-debug.log*
 package-lock.json.tmp
 

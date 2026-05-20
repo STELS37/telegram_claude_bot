@@ -27,6 +27,11 @@ function envBool(value) {
     if (value === undefined || value === null || value === '') return undefined;
     return /^(1|true|yes|on)$/i.test(String(value).trim());
 }
+function envInt(value) {
+    if (value === undefined || value === null || value === '') return undefined;
+    const parsed = Number(String(value).trim());
+    return Number.isFinite(parsed) ? parsed : undefined;
+}
 
 // Server deployments keep secrets and host-specific paths in systemd env files.
 // This lets the same bot logic run locally on Windows and remotely on Linux.
@@ -40,6 +45,14 @@ if (process.env.CLAUDE_ACCESS_DESCRIPTION) config.accessDescription = process.en
 if (process.env.HEARTBEAT_PATH) config.heartbeatPath = process.env.HEARTBEAT_PATH;
 const skipDanger = envBool(process.env.CLAUDE_SKIP_DANGEROUSLY_SKIP_PERMISSIONS);
 if (skipDanger !== undefined) config.skipDangerouslySkipPermissions = skipDanger;
+const claudeTimeoutOverride = envInt(process.env.CLAUDE_TIMEOUT_MS);
+if (claudeTimeoutOverride !== undefined) config.claudeTimeoutMs = claudeTimeoutOverride;
+const claudeStartupTimeoutOverride = envInt(process.env.CLAUDE_STARTUP_TIMEOUT_MS);
+if (claudeStartupTimeoutOverride !== undefined) config.claudeStartupTimeoutMs = claudeStartupTimeoutOverride;
+const claudeStallTimeoutOverride = envInt(process.env.CLAUDE_STALL_TIMEOUT_MS);
+if (claudeStallTimeoutOverride !== undefined) config.claudeStallTimeoutMs = claudeStallTimeoutOverride;
+const telegramRequestTimeoutOverride = envInt(process.env.TELEGRAM_REQUEST_TIMEOUT_MS);
+if (telegramRequestTimeoutOverride !== undefined) config.telegramRequestTimeoutMs = telegramRequestTimeoutOverride;
 
 // Bot id is used to keep sessions/settings/incoming files separate
 // when multiple bots run in parallel from the same folder.
@@ -248,6 +261,9 @@ function callClaudeStream(prompt, settings, sessionId, onEvent, onSpawn) {
         let stderrBuf = '';
         let lastResultEvent = null;
         let observedSessionId = null;  // ловим session_id из init-события — на случай если упадём до result
+        let finished = false;
+        let sawAnyOutput = false;
+        let lastActivityAt = Date.now();
 
         // claudeTimeoutMs:
         //   0 (или отрицательное) — без таймаута, может работать сколько угодно
@@ -257,13 +273,58 @@ function callClaudeStream(prompt, settings, sessionId, onEvent, onSpawn) {
             ? config.claudeTimeoutMs
             : 0;
         const timeout = timeoutMs > 0 ? setTimeout(() => {
-            killProcessTree(proc);
-            reject(new Error(`Claude не ответил за ${Math.round(timeoutMs / 1000)} сек`));
+            failOnce(new Error(`Claude не ответил за ${Math.round(timeoutMs / 1000)} сек`));
         }, timeoutMs) : null;
-        const clearT = () => { if (timeout) clearTimeout(timeout); };
+
+        // Общая длительность может быть без лимита, но "вечное typing" без событий
+        // нельзя оставлять. Startup timeout ловит зависший wrapper/OAuth sync до init,
+        // stall timeout ловит Claude/сеть без stdout/stderr после запуска.
+        const startupTimeoutMs = (typeof config.claudeStartupTimeoutMs === 'number' && config.claudeStartupTimeoutMs > 0)
+            ? config.claudeStartupTimeoutMs
+            : 90 * 1000;
+        const stallTimeoutMs = (typeof config.claudeStallTimeoutMs === 'number' && config.claudeStallTimeoutMs > 0)
+            ? config.claudeStallTimeoutMs
+            : 20 * 60 * 1000;
+        const startupTimeout = setTimeout(() => {
+            if (!sawAnyOutput) {
+                failOnce(new Error(`Claude не начал отвечать за ${Math.round(startupTimeoutMs / 1000)} сек`));
+            }
+        }, startupTimeoutMs);
+        const stallInterval = setInterval(() => {
+            const silentFor = Date.now() - lastActivityAt;
+            if (silentFor > stallTimeoutMs) {
+                failOnce(new Error(`Claude молчит ${Math.round(silentFor / 1000)} сек; процесс прерван, чтобы бот не висел в typing`));
+            }
+        }, Math.min(60 * 1000, Math.max(10 * 1000, Math.floor(stallTimeoutMs / 4))));
+
+        const clearT = () => {
+            if (timeout) clearTimeout(timeout);
+            clearTimeout(startupTimeout);
+            clearInterval(stallInterval);
+        };
+        function markActivity() {
+            sawAnyOutput = true;
+            lastActivityAt = Date.now();
+            clearTimeout(startupTimeout);
+            writeHeartbeat();
+        }
+        function failOnce(err) {
+            if (finished) return;
+            finished = true;
+            clearT();
+            err.observedSessionId = observedSessionId;
+            killProcessTree(proc);
+            reject(err);
+        }
+        function resolveOnce(result) {
+            if (finished) return;
+            finished = true;
+            clearT();
+            resolve(result);
+        }
 
         proc.stdout.on('data', d => {
-            writeHeartbeat();
+            markActivity();
             stdoutBuf += d.toString('utf8');
             const lines = stdoutBuf.split('\n');
             stdoutBuf = lines.pop();
@@ -284,14 +345,14 @@ function callClaudeStream(prompt, settings, sessionId, onEvent, onSpawn) {
         });
 
         proc.stderr.on('data', d => {
-            writeHeartbeat();
+            markActivity();
             stderrBuf += d.toString('utf8');
         });
 
-        proc.on('error', err => { writeHeartbeat(); clearT(); reject(err); });
+        proc.on('error', err => { markActivity(); failOnce(err); });
         proc.on('close', code => {
-            writeHeartbeat();
-            clearT();
+            markActivity();
+            if (finished) return;
             if (code !== 0) {
                 // Дампим stderr и хвост stdout для диагностики
                 try {
@@ -315,18 +376,23 @@ function callClaudeStream(prompt, settings, sessionId, onEvent, onSpawn) {
                     (stderrBuf ? `\nstderr: ${stderrBuf.slice(0, 500)}` : '\n(stderr пустой)')
                 );
                 err.observedSessionId = observedSessionId;
-                return reject(err);
+                return failOnce(err);
             }
             if (!lastResultEvent) {
                 const err = new Error('Claude закончил без result-события\n' + stderrBuf.slice(0, 400));
                 err.observedSessionId = observedSessionId;
-                return reject(err);
+                return failOnce(err);
             }
-            resolve(lastResultEvent);
+            resolveOnce(lastResultEvent);
         });
 
-        proc.stdin.write(prompt, 'utf8');
-        proc.stdin.end();
+        proc.stdin.on('error', err => failOnce(err));
+        try {
+            proc.stdin.write(prompt, 'utf8');
+            proc.stdin.end();
+        } catch (err) {
+            failOnce(err);
+        }
     });
 }
 
@@ -665,12 +731,18 @@ function statusText(userId) {
 // ===================================================================
 // BOT
 // ===================================================================
+const telegramRequestTimeoutMs = (typeof config.telegramRequestTimeoutMs === 'number' && config.telegramRequestTimeoutMs > 0)
+    ? config.telegramRequestTimeoutMs
+    : 60 * 1000;
 const bot = new TelegramBot(config.telegramToken, {
     polling: {
         params: {
             timeout: 30,
             allowed_updates: ['message', 'callback_query']
         }
+    },
+    request: {
+        timeout: telegramRequestTimeoutMs
     }
 });
 const isAllowed = (id) => Array.isArray(config.allowedUserIds) && config.allowedUserIds.includes(id);
@@ -1144,8 +1216,12 @@ bot.on('callback_query', async (query) => {
                 log('choice message edit failed:', e.message);
             }
 
-            // Send the chosen text back to Claude as if user typed it
-            await processUserMessage(userId, chatId, selected);
+            // Send the chosen text back to Claude as if user typed it.
+            // Keep it on the same per-user queue as normal messages; otherwise
+            // a button press can overlap an already running Telegram request.
+            enqueueForUser(userId, async () => {
+                await processUserMessage(userId, chatId, selected);
+            });
             return;
         }
 
