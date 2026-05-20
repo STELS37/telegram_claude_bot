@@ -654,7 +654,14 @@ function statusText(userId) {
 // ===================================================================
 // BOT
 // ===================================================================
-const bot = new TelegramBot(config.telegramToken, { polling: true });
+const bot = new TelegramBot(config.telegramToken, {
+    polling: {
+        params: {
+            timeout: 30,
+            allowed_updates: ['message', 'callback_query']
+        }
+    }
+});
 const isAllowed = (id) => Array.isArray(config.allowedUserIds) && config.allowedUserIds.includes(id);
 
 function ts() { return new Date().toISOString().slice(11, 19); }
