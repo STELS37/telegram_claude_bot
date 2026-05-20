@@ -38,6 +38,16 @@ Expected Claude entrypoint:
 
 If `/usr/bin/claude` is an OmniRoute/Claude Code wrapper, the bot automatically uses that rotation because it only calls the configured Claude CLI.
 
+## Parallel Bot
+
+For a second Telegram bot with an independent Claude session and user state, run the same `bot.js` with `config-linux-parallel.json` and a separate env file:
+
+```text
+/etc/claude-telegram-bot-parallel.env
+```
+
+The included `claude-telegram-bot-parallel.service` keeps its own heartbeat, sessions, settings, uploads, and pending inline choices under the `linux2` bot id.
+
 ## Safety
 
 Do not commit:
