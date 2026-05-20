@@ -47,6 +47,7 @@ const BOT_ID = config.id || path.basename(configPath, '.json');
 
 const SESSIONS_FILE = path.join(__dirname, `sessions-${BOT_ID}.json`);
 const SETTINGS_FILE = path.join(__dirname, `user-settings-${BOT_ID}.json`);
+const PENDING_CHOICES_FILE = path.join(__dirname, `pending-choices-${BOT_ID}.json`);
 const INCOMING_DIR = path.join(__dirname, 'incoming', BOT_ID);
 
 // One-time migration from old single-bot file names ONLY for the "main" bot.
@@ -387,18 +388,40 @@ function extractAsks(text) {
     return { text: cleaned, asks };
 }
 
-// In-memory store for pending choices: choiceId -> { userId, options[], createdAt }
-const pendingChoices = new Map();
+function loadPendingChoices() {
+    try {
+        const raw = JSON.parse(fs.readFileSync(PENDING_CHOICES_FILE, 'utf8'));
+        return new Map(Object.entries(raw || {}));
+    } catch {
+        return new Map();
+    }
+}
+function savePendingChoices() {
+    const obj = Object.fromEntries(pendingChoices);
+    fs.writeFileSync(PENDING_CHOICES_FILE, JSON.stringify(obj, null, 2));
+}
+
+// Persistent store for pending choices: choiceId -> { userId, options[], createdAt }.
+// Inline buttons may be pressed after a service restart, so memory-only state is too fragile.
+const pendingChoices = loadPendingChoices();
 function createPendingChoice(userId, options) {
     // короткий id из 6 символов
     const id = Math.random().toString(36).slice(2, 8);
     pendingChoices.set(id, { userId, options, createdAt: Date.now() });
+    savePendingChoices();
     return id;
 }
 // Очистка старых выборов каждые 30 мин
 setInterval(() => {
     const cutoff = Date.now() - 60 * 60 * 1000;
-    for (const [k, v] of pendingChoices) if (v.createdAt < cutoff) pendingChoices.delete(k);
+    let changed = false;
+    for (const [k, v] of pendingChoices) {
+        if (v.createdAt < cutoff) {
+            pendingChoices.delete(k);
+            changed = true;
+        }
+    }
+    if (changed) savePendingChoices();
 }, 30 * 60 * 1000);
 
 // ===================================================================
@@ -1048,13 +1071,27 @@ async function processUserMessage(userId, chatId, prompt) {
 // --- inline keyboard ---
 bot.on('callback_query', async (query) => {
     writeHeartbeat();
-    const userId = query.from.id;
+    const userId = query.from && query.from.id;
+    const data = query.data || '';
+    let callbackAnswered = false;
+    const answerCallback = async (options = {}) => {
+        if (callbackAnswered) return;
+        callbackAnswered = true;
+        try { await bot.answerCallbackQuery(query.id, options); }
+        catch (e) { log('answerCallbackQuery failed:', e.message); }
+    };
+
+    log(`callback from ${userId}: ${data || '(empty)'}${query.message ? '' : ' (no message)'}`);
+
+    if (!isAllowed(userId)) {
+        await answerCallback({ text: 'Доступ запрещён', show_alert: true }); return;
+    }
+    if (!query.message) {
+        await answerCallback({ text: 'Сообщение с кнопкой недоступно', show_alert: true }); return;
+    }
+
     const chatId = query.message.chat.id;
     const msgId = query.message.message_id;
-    const data = query.data;
-    if (!isAllowed(userId)) {
-        bot.answerCallbackQuery(query.id, { text: 'Доступ запрещён', show_alert: true }); return;
-    }
     try {
         // Handle ASK button click
         if (data.startsWith('choice:')) {
@@ -1064,26 +1101,30 @@ bot.on('callback_query', async (query) => {
             const choice = pendingChoices.get(choiceId);
 
             if (!choice || choice.userId !== userId) {
-                await bot.answerCallbackQuery(query.id, { text: '⌛ Выбор устарел или уже использован', show_alert: false });
+                await answerCallback({ text: '⌛ Выбор устарел или уже использован', show_alert: false });
                 return;
             }
             if (Number.isNaN(index) || index < 0 || index >= choice.options.length) {
-                await bot.answerCallbackQuery(query.id, { text: 'Неверный вариант', show_alert: false });
+                await answerCallback({ text: 'Неверный вариант', show_alert: false });
                 return;
             }
             const selected = choice.options[index];
             pendingChoices.delete(choiceId);
+            savePendingChoices();
+            log(`choice selected by ${userId}: ${selected.slice(0, 120)}`);
 
             // Acknowledge button press
-            await bot.answerCallbackQuery(query.id, { text: '✓ ' + selected.slice(0, 50) });
+            await answerCallback({ text: '✓ ' + selected.slice(0, 50) });
 
             // Update the question message: keep question, replace keyboard with selected
             try {
                 const questionText = (query.message.text || '').replace(/^❓ /, '');
-                await bot.editMessageText(`❓ ${questionText}\n\n✓ Выбрано: *${selected}*`, {
-                    chat_id: chatId, message_id: msgId, parse_mode: 'Markdown'
+                await bot.editMessageText(`❓ ${questionText}\n\n✓ Выбрано: ${selected}`, {
+                    chat_id: chatId, message_id: msgId
                 });
-            } catch (e) { /* ignore */ }
+            } catch (e) {
+                log('choice message edit failed:', e.message);
+            }
 
             // Send the chosen text back to Claude as if user typed it
             await processUserMessage(userId, chatId, selected);
@@ -1091,15 +1132,17 @@ bot.on('callback_query', async (query) => {
         }
 
         if (data === 'menu:main') {
+            await answerCallback();
             await bot.editMessageText(welcomeText(), { chat_id: chatId, message_id: msgId, reply_markup: mainMenuKeyboard() });
         } else if (data === 'menu:settings') {
+            await answerCallback();
             await bot.editMessageText('⚙ Настройки\n\nНажми, чтобы изменить:', {
                 chat_id: chatId, message_id: msgId,
                 reply_markup: settingsMenuKeyboard(getUserSettings(userId))
             });
         } else if (data === 'cmd:new') {
             const sessions = loadSessions(); delete sessions[userId]; saveSessions(sessions);
-            await bot.answerCallbackQuery(query.id, { text: '✓ Контекст сброшен' });
+            await answerCallback({ text: '✓ Контекст сброшен' });
             await bot.sendMessage(chatId, '✓ Новый диалог.'); return;
         } else if (data === 'cmd:stop') {
             const proc = userActiveClaude.get(userId);
@@ -1107,19 +1150,21 @@ bot.on('callback_query', async (query) => {
                 markRecentlyStopped(userId);
                 killProcessTree(proc);
                 userActiveClaude.delete(userId);
-                await bot.answerCallbackQuery(query.id, { text: '⛔ Остановлено' });
+                await answerCallback({ text: '⛔ Остановлено' });
                 await bot.sendMessage(chatId, '⛔ Текущий запрос и все дочерние процессы прерваны.');
                 log(`/stop by ${userId} via button — killed PID tree ${proc.pid}`);
             } else {
-                await bot.answerCallbackQuery(query.id, { text: 'Ничего не выполняется', show_alert: false });
+                await answerCallback({ text: 'Ничего не выполняется', show_alert: false });
             }
             return;
         } else if (data === 'cmd:status') {
+            await answerCallback();
             await bot.sendMessage(chatId, statusText(userId), { parse_mode: 'Markdown' });
-            await bot.answerCallbackQuery(query.id); return;
+            return;
         } else if (data === 'cmd:help') {
+            await answerCallback();
             await bot.sendMessage(chatId, helpText(), { parse_mode: 'Markdown' });
-            await bot.answerCallbackQuery(query.id); return;
+            return;
         } else if (data.startsWith('set:')) {
             const key = data.slice(4);
             const cur = getUserSettings(userId);
@@ -1131,13 +1176,16 @@ bot.on('callback_query', async (query) => {
             } else if (['rememberContext', 'fullAccess', 'webSearch', 'showProgress'].includes(key)) {
                 updated = setUserSettings(userId, { [key]: !cur[key] });
             }
+            if (!updated) {
+                await answerCallback({ text: 'Неизвестная настройка', show_alert: false }); return;
+            }
             await bot.editMessageReplyMarkup(settingsMenuKeyboard(updated), { chat_id: chatId, message_id: msgId });
-            await bot.answerCallbackQuery(query.id, { text: '✓ Сохранено' }); return;
+            await answerCallback({ text: '✓ Сохранено' }); return;
         }
-        await bot.answerCallbackQuery(query.id);
+        await answerCallback();
     } catch (err) {
-        console.error('callback_query error:', err.message);
-        await bot.answerCallbackQuery(query.id, { text: 'Ошибка: ' + err.message.slice(0, 100) }).catch(() => {});
+        log('callback_query error:', err.message);
+        await answerCallback({ text: 'Ошибка: ' + err.message.slice(0, 100), show_alert: true });
     }
 });
 

@@ -6,6 +6,7 @@ node_modules/
 *.err.log
 sessions*.json
 user-settings*.json
+pending-choices*.json
 incoming/
 crash-dumps/
 npm-debug.log*
