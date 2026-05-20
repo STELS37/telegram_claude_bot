@@ -185,6 +185,13 @@ function buildSystemPrompt(settings) {
         'Это правило ВАЖНЕЕ краткости — даже если responseLength=brief, перед инструментами комментарий обязателен.'
     );
 
+    parts.push(
+        'ЗАЩИТА ОТ ЗАВИСАНИЙ. На этом сервере Chromium/Google Chrome/Playwright может зависать на запуске. ' +
+        'Не используй Playwright, chromium, google-chrome или chrome-headless-shell для обычной диагностики, если можно решить задачу чтением файлов, логов, systemd, curl или API. ' +
+        'Если браузер всё-таки строго нужен, любой запуск браузера ОБЯЗАТЕЛЬНО оборачивай в короткий timeout (например `timeout 20s ...`) и при зависании продолжай анализ без браузера. ' +
+        'Никогда не оставляй браузерную команду без timeout.'
+    );
+
     // ---- Telegram formatting ----
     parts.push(
         'ФОРМАТ ВЫВОДА (TELEGRAM). Не markdown-рендер, а Telegram. ' +
