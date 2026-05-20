@@ -78,7 +78,7 @@ function writeHeartbeat() {
     try {
         const heartbeatDir = path.dirname(config.heartbeatPath);
         if (!fs.existsSync(heartbeatDir)) fs.mkdirSync(heartbeatDir, { recursive: true });
-        fs.writeFileSync(config.heartbeatPath, String(Date.now()));
+        fs.writeFileSync(config.heartbeatPath, `${Date.now()}\n`);
     } catch (e) {
         console.error('heartbeat failed:', e.message);
     }

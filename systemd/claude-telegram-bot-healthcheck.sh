@@ -15,7 +15,8 @@ if [[ ! -s "$hb" ]]; then
 fi
 
 now_ms=$(( $(date +%s) * 1000 ))
-read -r last_ms < "$hb" || last_ms=0
+last_ms=$(tr -cd '0-9' < "$hb" | head -c 20 || true)
+last_ms=${last_ms:-0}
 
 if ! [[ "$last_ms" =~ ^[0-9]+$ ]]; then
   systemctl restart "$svc"
