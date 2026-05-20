@@ -3,13 +3,16 @@ set -euo pipefail
 
 svc=claude-telegram-bot.service
 hb=/run/claude-telegram-bot/heartbeat
+max_age_ms=900000
 
 if ! systemctl is-active --quiet "$svc"; then
+  logger -t claude-telegram-bot-healthcheck "$svc inactive; restarting"
   systemctl restart "$svc"
   exit 0
 fi
 
 if [[ ! -s "$hb" ]]; then
+  logger -t claude-telegram-bot-healthcheck "heartbeat missing; restarting $svc"
   systemctl restart "$svc"
   exit 0
 fi
@@ -19,10 +22,13 @@ last_ms=$(tr -cd '0-9' < "$hb" | head -c 20 || true)
 last_ms=${last_ms:-0}
 
 if ! [[ "$last_ms" =~ ^[0-9]+$ ]]; then
+  logger -t claude-telegram-bot-healthcheck "heartbeat invalid; restarting $svc"
   systemctl restart "$svc"
   exit 0
 fi
 
-if (( now_ms - last_ms > 180000 )); then
+age_ms=$(( now_ms - last_ms ))
+if (( age_ms > max_age_ms )); then
+  logger -t claude-telegram-bot-healthcheck "heartbeat stale (${age_ms}ms > ${max_age_ms}ms); restarting $svc"
   systemctl restart "$svc"
 fi

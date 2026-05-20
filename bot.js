@@ -257,6 +257,7 @@ function callClaudeStream(prompt, settings, sessionId, onEvent, onSpawn) {
         const clearT = () => { if (timeout) clearTimeout(timeout); };
 
         proc.stdout.on('data', d => {
+            writeHeartbeat();
             stdoutBuf += d.toString('utf8');
             const lines = stdoutBuf.split('\n');
             stdoutBuf = lines.pop();
@@ -276,10 +277,14 @@ function callClaudeStream(prompt, settings, sessionId, onEvent, onSpawn) {
             }
         });
 
-        proc.stderr.on('data', d => { stderrBuf += d.toString('utf8'); });
+        proc.stderr.on('data', d => {
+            writeHeartbeat();
+            stderrBuf += d.toString('utf8');
+        });
 
-        proc.on('error', err => { clearT(); reject(err); });
+        proc.on('error', err => { writeHeartbeat(); clearT(); reject(err); });
         proc.on('close', code => {
+            writeHeartbeat();
             clearT();
             if (code !== 0) {
                 // Дампим stderr и хвост stdout для диагностики
