@@ -1,0 +1,50 @@
+# Telegram Claude Bot
+
+Telegram bot bridge for Claude Code.
+
+It keeps the original desktop bot behavior:
+
+- streams Claude Code progress into Telegram;
+- supports `/start`, `/menu`, `/new`, `/stop`, `/settings`, `/status`, `/help`;
+- downloads user files into `incoming/<bot>/<user>/`;
+- can send files back with `[[SEND_FILE:/absolute/path]]`;
+- supports inline choice buttons with `[[ASK:question|option 1|option 2]]`;
+- stores sessions and per-user settings separately per bot id.
+
+## Install
+
+```bash
+npm ci --omit=dev
+cp .env.example /etc/claude-telegram-bot.env
+nano /etc/claude-telegram-bot.env
+node bot.js config-linux.json
+```
+
+`TELEGRAM_BOT_TOKEN` and real credentials must stay outside git.
+
+## Linux Service
+
+The production service runs the bot from:
+
+```text
+/a0/usr/projects/telegram_claude_bot
+```
+
+Expected Claude entrypoint:
+
+```text
+/usr/bin/claude
+```
+
+If `/usr/bin/claude` is an OmniRoute/Claude Code wrapper, the bot automatically uses that rotation because it only calls the configured Claude CLI.
+
+## Safety
+
+Do not commit:
+
+- Telegram tokens;
+- Anthropic/Claude OAuth files;
+- `.env` files;
+- `sessions*.json`;
+- `user-settings*.json`;
+- logs, uploads, and crash dumps.

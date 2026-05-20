@@ -1,0 +1,6 @@
+[Unit]
+Description=Healthcheck Claude Telegram Bot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/claude-telegram-bot-healthcheck.sh

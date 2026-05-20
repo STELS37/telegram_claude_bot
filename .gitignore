@@ -1,0 +1,18 @@
+node_modules/
+.env
+.env.*
+!.env.example
+*.log
+*.err.log
+sessions*.json
+user-settings*.json
+incoming/
+crash-dumps/
+npm-debug.log*
+package-lock.json.tmp
+
+# Local machine-specific configs. Keep config-linux.json as a safe template.
+config-main.json
+config-parallel.json
+config.json
+*.local.json

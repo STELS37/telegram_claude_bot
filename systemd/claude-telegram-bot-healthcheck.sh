@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+svc=claude-telegram-bot.service
+hb=/run/claude-telegram-bot/heartbeat
+
+if ! systemctl is-active --quiet "$svc"; then
+  systemctl restart "$svc"
+  exit 0
+fi
+
+if [[ ! -s "$hb" ]]; then
+  systemctl restart "$svc"
+  exit 0
+fi
+
+now_ms=$(( $(date +%s) * 1000 ))
+read -r last_ms < "$hb" || last_ms=0
+
+if ! [[ "$last_ms" =~ ^[0-9]+$ ]]; then
+  systemctl restart "$svc"
+  exit 0
+fi
+
+if (( now_ms - last_ms > 180000 )); then
+  systemctl restart "$svc"
+fi

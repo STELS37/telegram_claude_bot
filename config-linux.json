@@ -1,0 +1,15 @@
+{
+  "id": "linux",
+  "label": "@ClaudeLinux_My_Bot (Linux, OmniRoute rotation)",
+  "telegramToken": "PASTE_TOKEN_IN_ENV",
+  "allowedUserIds": [],
+  "workdir": "/root",
+  "claudePath": "/usr/bin/claude",
+  "claudeModel": "claude-opus-4-7[1m]",
+  "maxMessageLength": 3800,
+  "claudeTimeoutMs": 0,
+  "home": "/root",
+  "accessDescription": "Linux-серверу (Bash, файлы, сеть).",
+  "skipDangerouslySkipPermissions": true,
+  "heartbeatPath": "/run/claude-telegram-bot/heartbeat"
+}

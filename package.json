@@ -1,0 +1,12 @@
+{
+  "name": "telegram-claude-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot bridge for Claude Code with streaming progress, files, and Linux systemd deployment",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
