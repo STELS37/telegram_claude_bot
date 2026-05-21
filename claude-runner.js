@@ -81,6 +81,21 @@ function copyIfExists(src, dest, mode = 0o600) {
     return true;
 }
 
+function linkClaudeProjects(destClaudeDir, warnings) {
+    const src = path.join(ROOT_CLAUDE_DIR, 'projects');
+    const dest = path.join(destClaudeDir, 'projects');
+    if (!fs.existsSync(src)) {
+        warnings.push('root Claude projects directory missing; resume may not work');
+        return;
+    }
+    try {
+        if (fs.existsSync(dest)) return;
+        fs.symlinkSync(src, dest, 'dir');
+    } catch (err) {
+        warnings.push(`projects link failed: ${err.message}`);
+    }
+}
+
 function prepareClaudeLaunch(config) {
     const childEnv = { ...process.env };
     delete childEnv.ANTHROPIC_API_KEY;
@@ -126,6 +141,7 @@ function prepareClaudeLaunch(config) {
 
             copyIfExists(path.join(ROOT_CLAUDE_DIR, 'settings.json'), path.join(isolatedClaudeDir, 'settings.json'), 0o600);
             copyIfExists(path.join(ROOT_CLAUDE_DIR, 'policy-limits.json'), path.join(isolatedClaudeDir, 'policy-limits.json'), 0o600);
+            linkClaudeProjects(isolatedClaudeDir, warnings);
         });
 
         claudePath = officialPath;
@@ -135,6 +151,16 @@ function prepareClaudeLaunch(config) {
 
     childEnv.HOME = home;
     return { claudePath, childEnv, home, launchMode, warnings };
+}
+
+function resultErrorMessage(event, stderrBuf) {
+    if (!event) return tailText(stderrBuf, 2000) || 'Claude failed without a result event';
+    if (Array.isArray(event.errors) && event.errors.length) return event.errors.join('\n');
+    if (event.result) return String(event.result);
+    if (event.error) return String(event.error);
+    if (event.message && typeof event.message === 'string') return event.message;
+    if (event.api_error_status) return `Claude API error ${event.api_error_status}`;
+    return tailText(stderrBuf, 2000) || 'Claude reported an error without details';
 }
 
 function envBool(value) {
@@ -390,7 +416,7 @@ try {
             mergeState({
                 ...base,
                 status: 'error',
-                error: lastResultEvent.result || `Claude API error ${lastResultEvent.api_error_status || 'unknown'}`,
+                error: resultErrorMessage(lastResultEvent, stderrBuf),
                 api_error_status: lastResultEvent.api_error_status || null,
                 resultEvent: lastResultEvent,
                 result: lastResultEvent.result || lastResultEvent.message || '',

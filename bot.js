@@ -1151,7 +1151,10 @@ function startJobMonitor(jobId, options = {}) {
                     } catch {}
                 }
                 const errMsg = state.error || 'Claude job failed';
-                const sid = state.observedSessionId;
+                const resumeMissing = String(state.error || '').includes('No conversation found with session ID');
+                const sid = resumeMissing
+                    ? (state.sessionId || null)
+                    : (state.session_id || state.observedSessionId || state.sessionId || null);
                 if (sid && settings.rememberContext) {
                     const sessions = loadSessions();
                     sessions[userId] = sid;
