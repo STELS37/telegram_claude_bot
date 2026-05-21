@@ -1,4 +1,4 @@
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
@@ -14,6 +14,9 @@ const jobFile = path.join(jobDir, 'job.json');
 const stateFile = path.join(jobDir, 'state.json');
 const eventsFile = path.join(jobDir, 'events.jsonl');
 const stderrFile = path.join(jobDir, 'stderr.log');
+const OFFICIAL_CLAUDE_PATH = '/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe';
+const OAUTH_SYNC_PATH = '/usr/local/sbin/sync-omniroute-claude-code-oauth.js';
+const ROOT_CLAUDE_DIR = '/root/.claude';
 
 function readJson(file, fallback = {}) {
     try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -45,6 +48,93 @@ function appendEvent(event) {
 function tailText(text, max = 12000) {
     text = String(text || '');
     return text.length > max ? text.slice(-max) : text;
+}
+
+function sleepSync(ms) {
+    const view = new Int32Array(new SharedArrayBuffer(4));
+    Atomics.wait(view, 0, 0, ms);
+}
+
+function withFileLock(lockDir, fn) {
+    const start = Date.now();
+    while (true) {
+        try {
+            fs.mkdirSync(lockDir, { mode: 0o700 });
+            break;
+        } catch (err) {
+            if (Date.now() - start > 60 * 1000) throw new Error(`Timed out waiting for lock ${lockDir}`);
+            sleepSync(200);
+        }
+    }
+    try {
+        return fn();
+    } finally {
+        try { fs.rmdirSync(lockDir); } catch {}
+    }
+}
+
+function copyIfExists(src, dest, mode = 0o600) {
+    if (!fs.existsSync(src)) return false;
+    fs.mkdirSync(path.dirname(dest), { recursive: true, mode: 0o700 });
+    fs.copyFileSync(src, dest);
+    fs.chmodSync(dest, mode);
+    return true;
+}
+
+function prepareClaudeLaunch(config) {
+    const childEnv = { ...process.env };
+    delete childEnv.ANTHROPIC_API_KEY;
+    delete childEnv.ANTHROPIC_BASE_URL;
+    delete childEnv.ANTHROPIC_CUSTOM_HEADERS;
+    delete childEnv.CLAUDE_CODE_USE_BEDROCK;
+    delete childEnv.CLAUDE_CODE_USE_VERTEX;
+    childEnv.CLAUDE_CODE_EFFORT_LEVEL = childEnv.CLAUDE_CODE_EFFORT_LEVEL || 'max';
+    childEnv.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT = childEnv.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT || '1';
+
+    const isolate = config.isolateClaudeHome !== false;
+    const officialPath = config.claudeOfficialPath || OFFICIAL_CLAUDE_PATH;
+    const warnings = [];
+    let claudePath = config.claudePath;
+    let home = config.home || process.env.HOME || '/root';
+    let launchMode = 'configured-home';
+
+    if (isolate && fs.existsSync(officialPath)) {
+        const isolatedHome = path.join(jobDir, 'home');
+        const isolatedClaudeDir = path.join(isolatedHome, '.claude');
+        fs.mkdirSync(isolatedClaudeDir, { recursive: true, mode: 0o700 });
+
+        withFileLock('/tmp/claude-oauth-sync.lock', () => {
+            if (fs.existsSync(OAUTH_SYNC_PATH)) {
+                const sync = spawnSync(process.execPath, [OAUTH_SYNC_PATH, '--quiet'], {
+                    cwd: config.workdir || '/root',
+                    env: { ...process.env },
+                    stdio: 'ignore',
+                    timeout: 60 * 1000
+                });
+                if (sync.status !== 0) warnings.push(`oauth sync exited ${sync.status}`);
+                if (sync.error) warnings.push(`oauth sync error: ${sync.error.message}`);
+            } else {
+                warnings.push('oauth sync script missing');
+            }
+
+            const copiedCreds = copyIfExists(
+                path.join(ROOT_CLAUDE_DIR, '.credentials.json'),
+                path.join(isolatedClaudeDir, '.credentials.json'),
+                0o600
+            );
+            if (!copiedCreds) warnings.push('root Claude credentials missing');
+
+            copyIfExists(path.join(ROOT_CLAUDE_DIR, 'settings.json'), path.join(isolatedClaudeDir, 'settings.json'), 0o600);
+            copyIfExists(path.join(ROOT_CLAUDE_DIR, 'policy-limits.json'), path.join(isolatedClaudeDir, 'policy-limits.json'), 0o600);
+        });
+
+        claudePath = officialPath;
+        home = isolatedHome;
+        launchMode = 'isolated-home';
+    }
+
+    childEnv.HOME = home;
+    return { claudePath, childEnv, home, launchMode, warnings };
 }
 
 function envBool(value) {
@@ -167,10 +257,6 @@ if (!job) {
 const config = loadConfig();
 const settings = job.settings || {};
 const args = buildClaudeArgs(config, settings, job.sessionId);
-const childEnv = { ...process.env };
-if (config.home) childEnv.HOME = config.home;
-childEnv.CLAUDE_CODE_EFFORT_LEVEL = childEnv.CLAUDE_CODE_EFFORT_LEVEL || 'max';
-childEnv.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT = childEnv.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT || '1';
 
 let proc = null;
 let stdoutBuf = '';
@@ -197,6 +283,7 @@ process.on('SIGINT', () => {
 });
 
 try {
+    const launch = prepareClaudeLaunch(config);
     mergeState({
         jobId: job.jobId,
         botId: job.botId,
@@ -206,18 +293,21 @@ try {
         runnerPid: process.pid,
         startedAt: new Date().toISOString(),
         lastActivityAt: new Date().toISOString(),
-        claudePath: config.claudePath,
+        claudePath: launch.claudePath,
+        claudeHome: launch.home,
+        launchMode: launch.launchMode,
+        launchWarnings: launch.warnings,
         workdir: config.workdir,
         model: config.claudeModel || '',
         sessionId: job.sessionId || null
     });
 
-    proc = spawn(config.claudePath, args, {
+    proc = spawn(launch.claudePath, args, {
         shell: false,
         cwd: config.workdir,
         windowsHide: true,
         detached: process.platform !== 'win32',
-        env: childEnv
+        env: launch.childEnv
     });
 
     mergeState({ claudePid: proc.pid, lastActivityAt: new Date().toISOString() });
@@ -290,17 +380,30 @@ try {
                 status: 'stopped',
                 error: `Claude stopped by user${signal ? ` (${signal})` : ''}`
             });
-        } else if (code !== 0) {
-            mergeState({
-                ...base,
-                status: 'error',
-                error: `Claude exit ${code}${signal ? ` signal ${signal}` : ''}`
-            });
         } else if (!lastResultEvent) {
             mergeState({
                 ...base,
                 status: 'error',
                 error: 'Claude finished without result event'
+            });
+        } else if (lastResultEvent.is_error) {
+            mergeState({
+                ...base,
+                status: 'error',
+                error: lastResultEvent.result || `Claude API error ${lastResultEvent.api_error_status || 'unknown'}`,
+                api_error_status: lastResultEvent.api_error_status || null,
+                resultEvent: lastResultEvent,
+                result: lastResultEvent.result || lastResultEvent.message || '',
+                session_id: lastResultEvent.session_id || observedSessionId || null
+            });
+        } else if (code !== 0) {
+            mergeState({
+                ...base,
+                status: 'error',
+                error: `Claude exit ${code}${signal ? ` signal ${signal}` : ''}`,
+                resultEvent: lastResultEvent,
+                result: lastResultEvent.result || lastResultEvent.message || '',
+                session_id: lastResultEvent.session_id || observedSessionId || null
             });
         } else {
             mergeState({
