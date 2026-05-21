@@ -910,6 +910,13 @@ function formatAge(iso) {
     return `${hours} ч ${min % 60} мин`;
 }
 
+function isOmniRouteQuotaNotice(text) {
+    const value = String(text || '');
+    return value.includes('Сейчас нет свободного Claude Opus')
+        || value.includes('Нет доступного Claude-аккаунта')
+        || value.includes('No quota-eligible OmniRoute Claude connection');
+}
+
 function currentJobStatusText(userId) {
     const current = getCurrentLiveJob(userId);
     if (!current) return '🧵 Активная задача: нет';
@@ -1289,13 +1296,14 @@ function startJobMonitor(jobId, options = {}) {
             } else {
                 if (statusMsgId) {
                     try {
-                        await bot.editMessageText(renderStatus('⚠ Ошибка'), {
+                        await bot.editMessageText(renderStatus(quotaNotice ? '⏳ Лимиты Claude' : '⚠ Ошибка'), {
                             chat_id: chatId, message_id: statusMsgId,
                             disable_web_page_preview: true
                         });
                     } catch {}
                 }
                 const errMsg = state.error || 'Claude job failed';
+                const quotaNotice = isOmniRouteQuotaNotice(errMsg);
                 const resumeMissing = String(state.error || '').includes('No conversation found with session ID');
                 const sid = resumeMissing
                     ? (state.sessionId || null)
@@ -1305,8 +1313,9 @@ function startJobMonitor(jobId, options = {}) {
                     sessions[userId] = sid;
                     saveSessions(sessions);
                 }
-                const hint = sid ? '\n\nℹ Сессия сохранена. Просто напиши «продолжай» — попробую с того же места.' : '';
-                for (const chunk of splitForTelegram('⚠ Ошибка:\n' + errMsg + hint, config.maxMessageLength || 3800)) {
+                const hint = !quotaNotice && sid ? '\n\nℹ Сессия сохранена. Просто напиши «продолжай» — попробую с того же места.' : '';
+                const prefix = quotaNotice ? '' : '⚠ Ошибка:\n';
+                for (const chunk of splitForTelegram(prefix + errMsg + hint, config.maxMessageLength || 3800)) {
                     await bot.sendMessage(chatId, chunk).catch(() => {});
                 }
             }
@@ -1780,7 +1789,7 @@ async function processUserMessageLegacy(userId, chatId, prompt) {
         if (statusMsgId) {
             try {
                 await bot.editMessageText(
-                    wasManuallyStopped ? renderStatus() + '\n\n⛔ Прервано пользователем' : renderStatus() + '\n\n⚠ Ошибка',
+                    wasManuallyStopped ? renderStatus() + '\n\n⛔ Прервано пользователем' : renderStatus() + '\n\n' + (isOmniRouteQuotaNotice(err && err.message) ? '⏳ Лимиты Claude' : '⚠ Ошибка'),
                     { chat_id: chatId, message_id: statusMsgId, disable_web_page_preview: true }
                 );
             } catch {}
@@ -1789,10 +1798,12 @@ async function processUserMessageLegacy(userId, chatId, prompt) {
 
         if (!wasManuallyStopped) {
             const errMsg = String(err.message || err);
-            const hint = err.observedSessionId
+            const quotaNotice = isOmniRouteQuotaNotice(errMsg);
+            const hint = !quotaNotice && err.observedSessionId
                 ? '\n\nℹ Сессия сохранена. Просто напиши «продолжай» — попробую с того же места.'
                 : '';
-            for (const chunk of splitForTelegram('⚠ Ошибка:\n' + errMsg + hint, config.maxMessageLength || 3800)) {
+            const prefix = quotaNotice ? '' : '⚠ Ошибка:\n';
+            for (const chunk of splitForTelegram(prefix + errMsg + hint, config.maxMessageLength || 3800)) {
                 await bot.sendMessage(chatId, chunk).catch(() => {});
             }
         }

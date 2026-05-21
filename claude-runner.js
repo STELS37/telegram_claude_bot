@@ -163,6 +163,51 @@ function shortAccountName(account) {
     return id ? 'Без названия (' + id.slice(0, 8) + ')' : 'Claude account';
 }
 
+function quotaStatusText(status) {
+    const remaining = percentText(status && status.remaining);
+    const threshold = percentText(status && status.thresholdRemaining);
+    return remaining + '% (нужно ' + threshold + '%+)';
+}
+
+function availabilityLine(account) {
+    const availability = availabilityFromBlockingWindows(account);
+    const availableAt = formatFutureMoscowTime(availability.iso);
+    return availableAt || 'после обновления лимитов';
+}
+
+function blockerText(account) {
+    const blockers = blockingWindows(account);
+    if (!blockers.length) return 'ниже резерва';
+    return blockers.map((status) => {
+        const label = quotaWindowLabel(status.window) === '5ч' ? '5 часов' : '7 дней';
+        return label + ': ' + quotaStatusText(status);
+    }).join(', ');
+}
+
+function freshnessText(account) {
+    const blockers = blockingWindows(account);
+    const ages = blockers.map((status) => snapshotAgeText(status.snapshotAt)).filter(Boolean);
+    if (!ages.length) return '';
+    return 'Данные: ' + ages.join(', ') + '.';
+}
+
+function accountReserveLine(account) {
+    return '5ч ' + percentText(account.session && account.session.remaining) + '%, 7д ' + percentText(account.weekly && account.weekly.remaining) + '%';
+}
+
+function buildAccountLine(account, index) {
+    const stale = blockingWindows(account).some((status) => {
+        const ms = Date.now() - new Date(status.snapshotAt || 0).getTime();
+        return Number.isFinite(ms) && ms > 20 * 60 * 1000;
+    });
+    return [
+        String(index + 1) + '. ' + shortAccountName(account) + ' — ' + availabilityLine(account),
+        '   Остаток: ' + accountReserveLine(account) + '.',
+        '   Не проходит: ' + blockerText(account) + '.',
+        stale ? '   Данные по этому аккаунту старые, OmniRoute обновит их отдельно.' : null
+    ].filter(Boolean).join('\n');
+}
+
 function buildOmniRouteQuotaStatusMessage() {
     const rotatorPath = '/usr/local/sbin/omniroute-claude-quota-rotate.js';
     if (!fs.existsSync(rotatorPath)) return '';
@@ -199,32 +244,26 @@ function buildOmniRouteQuotaStatusMessage() {
             if (at !== bt) return at - bt;
             return (b.score || 0) - (a.score || 0);
         })
-        .slice(0, 5)
-        .map((account, index) => {
-            const availability = availabilityFromBlockingWindows(account);
-            const availableAt = formatFutureMoscowTime(availability.iso);
-            const blockers = blockingWindows(account);
-            const snapshotAges = blockers
-                .map((status) => snapshotAgeText(status.snapshotAt))
-                .filter(Boolean);
-            const sourceLine = availability.source
-                ? '   время: по ' + availability.source + (snapshotAges.length ? '; ' + snapshotAges.join(', ') : '')
-                : '   время: точный resetAt не найден, нужен refresh лимитов';
-            return [
-                String(index + 1) + '. ' + shortAccountName(account),
-                '   ' + windowLine(account.session) + '; ' + windowLine(account.weekly),
-                '   пройдёт наше правило: ' + (availableAt || 'после обновления лимитов'),
-                sourceLine
-            ].join('\n');
-        });
+        .slice(0, 5);
+
+    const next = accounts[0] || null;
+    const nextLines = next
+        ? [
+            'Ближайший запуск Opus 4.7:',
+            shortAccountName(next) + ' — ' + availabilityLine(next) + '.',
+            'Сейчас: ' + accountReserveLine(next) + '. Не хватает: ' + blockerText(next) + '.'
+        ]
+        : ['Ближайший запуск Opus 4.7: нет данных.'];
 
     return [
-        'Нет доступного Claude-аккаунта для Opus 4.7 по резервам OmniRoute.',
-        'Правило: 5ч >= ' + (thresholds.sessionMinRemaining ?? 50) + '%, 7д >= ' + (thresholds.weeklyMinRemaining ?? 20) + '% остатка.',
-        'Claude Code не запущен на старых credentials, чтобы не получить 429 и не тратить лимит впустую.',
+        'Сейчас Opus 4.7 запускать нельзя: все Claude-аккаунты ниже резерва.',
         '',
-        'Аккаунты и ближайшее прохождение правила:',
-        ...accounts
+        ...nextLines,
+        '',
+        'Правило резерва: 5ч >= ' + (thresholds.sessionMinRemaining ?? 50) + '%, 7д >= ' + (thresholds.weeklyMinRemaining ?? 20) + '%.',
+        '',
+        'Все аккаунты:',
+        ...accounts.map(buildAccountLine)
     ].join('\n');
 }
 
