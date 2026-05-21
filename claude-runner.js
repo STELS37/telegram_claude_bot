@@ -17,6 +17,22 @@ const stderrFile = path.join(jobDir, 'stderr.log');
 const OFFICIAL_CLAUDE_PATH = '/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe';
 const OAUTH_SYNC_PATH = '/usr/local/sbin/sync-omniroute-claude-code-oauth.js';
 const ROOT_CLAUDE_DIR = '/root/.claude';
+const FULL_ACCESS_TOOLS = [
+    'Bash(*)',
+    'Read(*)',
+    'Write(*)',
+    'Edit(*)',
+    'MultiEdit(*)',
+    'Glob(*)',
+    'Grep(*)',
+    'LS(*)',
+    'TodoWrite(*)',
+    'Task(*)',
+    'WebFetch(*)',
+    'WebSearch(*)',
+    'NotebookRead(*)',
+    'NotebookEdit(*)'
+];
 
 function readJson(file, fallback = {}) {
     try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -217,6 +233,16 @@ function buildSystemPrompt(config, settings) {
         'Для простой диагностики предпочитай чтение файлов, логов, systemd, curl или API.'
     );
 
+    if (settings.fullAccess) {
+        parts.push(
+            'ПАМЯТЬ БЕЗ ПОДТВЕРЖДЕНИЙ. Если нужно сохранить долговременную память/заметку Claude Code, пиши markdown-файлы в ' +
+            '`/root/.claude/projects/-root/memory/`. Не используй путь из текущего isolated HOME вида ' +
+            '`.../runs-*/.../home/.claude/projects/.../memory/` — Claude Code считает его sensitive и может отклонить Write. ' +
+            'Для memory-файлов НИКОГДА не используй Write/Edit/MultiEdit: сразу используй Bash heredoc ' +
+            '(`mkdir -p ... && cat > ... <<\\\'EOF\\\'`). Не проси подтверждение у пользователя.'
+        );
+    }
+
     parts.push(
         'ФОРМАТ ВЫВОДА (TELEGRAM). Не markdown-рендер, а Telegram. ' +
         'Разрешено: **жирный**, `inline-код`, ```блоки кода```, [текст](url), списки через `-`. ' +
@@ -248,7 +274,11 @@ function buildClaudeArgs(config, settings, sessionId) {
     args.push('--output-format', 'stream-json', '--verbose');
 
     if (settings.fullAccess) {
-        if (!config.skipDangerouslySkipPermissions) args.push('--dangerously-skip-permissions');
+        args.push('--permission-mode', config.fullAccessPermissionMode || 'acceptEdits');
+        args.push('--allowed-tools', FULL_ACCESS_TOOLS.join(','));
+        if (!config.skipDangerouslySkipPermissions && config.fullAccessPermissionMode === 'bypassPermissions') {
+            args.push('--dangerously-skip-permissions');
+        }
     } else {
         const tools = ['Read', 'Glob', 'Grep'];
         if (settings.webSearch) tools.push('WebSearch', 'WebFetch');

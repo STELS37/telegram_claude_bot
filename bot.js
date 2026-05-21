@@ -66,6 +66,22 @@ const INCOMING_DIR = path.join(__dirname, 'incoming', BOT_ID);
 const RUNS_DIR = path.join(__dirname, `runs-${BOT_ID}`);
 const CURRENT_JOBS_FILE = path.join(__dirname, `current-jobs-${BOT_ID}.json`);
 const CLAUDE_RUNNER_PATH = path.join(__dirname, 'claude-runner.js');
+const FULL_ACCESS_TOOLS = [
+    'Bash(*)',
+    'Read(*)',
+    'Write(*)',
+    'Edit(*)',
+    'MultiEdit(*)',
+    'Glob(*)',
+    'Grep(*)',
+    'LS(*)',
+    'TodoWrite(*)',
+    'Task(*)',
+    'WebFetch(*)',
+    'WebSearch(*)',
+    'NotebookRead(*)',
+    'NotebookEdit(*)'
+];
 
 // One-time migration from old single-bot file names ONLY for the "main" bot.
 // Любой другой бот стартует с пустыми файлами — иначе все боты подхватят
@@ -155,7 +171,11 @@ function buildClaudeArgs(settings, sessionId, streaming) {
     }
 
     if (settings.fullAccess) {
-        if (!config.skipDangerouslySkipPermissions) args.push('--dangerously-skip-permissions');
+        args.push('--permission-mode', config.fullAccessPermissionMode || 'acceptEdits');
+        args.push('--allowed-tools', FULL_ACCESS_TOOLS.join(','));
+        if (!config.skipDangerouslySkipPermissions && config.fullAccessPermissionMode === 'bypassPermissions') {
+            args.push('--dangerously-skip-permissions');
+        }
     } else {
         const tools = ['Read', 'Glob', 'Grep'];
         if (settings.webSearch) tools.push('WebSearch', 'WebFetch');
@@ -208,6 +228,16 @@ function buildSystemPrompt(settings) {
         'Для долгих браузерных операций используй разумные таймауты и закрывай browser/context после проверки, чтобы не оставлять фоновые процессы. ' +
         'Для простой диагностики предпочитай чтение файлов, логов, systemd, curl или API.'
     );
+
+    if (settings.fullAccess) {
+        parts.push(
+            'ПАМЯТЬ БЕЗ ПОДТВЕРЖДЕНИЙ. Если нужно сохранить долговременную память/заметку Claude Code, пиши markdown-файлы в ' +
+            '`/root/.claude/projects/-root/memory/`. Не используй путь из текущего isolated HOME вида ' +
+            '`.../runs-*/.../home/.claude/projects/.../memory/` — Claude Code считает его sensitive и может отклонить Write. ' +
+            'Для memory-файлов НИКОГДА не используй Write/Edit/MultiEdit: сразу используй Bash heredoc ' +
+            '(`mkdir -p ... && cat > ... <<\\\'EOF\\\'`). Не проси подтверждение у пользователя.'
+        );
+    }
 
     // ---- Telegram formatting ----
     parts.push(
