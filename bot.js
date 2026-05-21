@@ -276,36 +276,36 @@ function callClaudeStream(prompt, settings, sessionId, onEvent, onSpawn) {
             failOnce(new Error(`Claude не ответил за ${Math.round(timeoutMs / 1000)} сек`));
         }, timeoutMs) : null;
 
-        // Общая длительность может быть без лимита, но "вечное typing" без событий
-        // нельзя оставлять. Startup timeout ловит зависший wrapper/OAuth sync до init,
-        // stall timeout ловит Claude/сеть без stdout/stderr после запуска.
-        const startupTimeoutMs = (typeof config.claudeStartupTimeoutMs === 'number' && config.claudeStartupTimeoutMs > 0)
+        // Optional diagnostics-only guardrails. They are disabled by default
+        // because long real work can be silent for a while. Set explicit
+        // positive values in config/env only for temporary debugging.
+        const startupTimeoutMs = (typeof config.claudeStartupTimeoutMs === 'number')
             ? config.claudeStartupTimeoutMs
-            : 90 * 1000;
-        const stallTimeoutMs = (typeof config.claudeStallTimeoutMs === 'number' && config.claudeStallTimeoutMs > 0)
+            : 0;
+        const stallTimeoutMs = (typeof config.claudeStallTimeoutMs === 'number')
             ? config.claudeStallTimeoutMs
-            : 20 * 60 * 1000;
-        const startupTimeout = setTimeout(() => {
+            : 0;
+        const startupTimeout = startupTimeoutMs > 0 ? setTimeout(() => {
             if (!sawAnyOutput) {
                 failOnce(new Error(`Claude не начал отвечать за ${Math.round(startupTimeoutMs / 1000)} сек`));
             }
-        }, startupTimeoutMs);
-        const stallInterval = setInterval(() => {
+        }, startupTimeoutMs) : null;
+        const stallInterval = stallTimeoutMs > 0 ? setInterval(() => {
             const silentFor = Date.now() - lastActivityAt;
             if (silentFor > stallTimeoutMs) {
                 failOnce(new Error(`Claude молчит ${Math.round(silentFor / 1000)} сек; процесс прерван, чтобы бот не висел в typing`));
             }
-        }, Math.min(60 * 1000, Math.max(10 * 1000, Math.floor(stallTimeoutMs / 4))));
+        }, Math.min(60 * 1000, Math.max(10 * 1000, Math.floor(stallTimeoutMs / 4)))) : null;
 
         const clearT = () => {
             if (timeout) clearTimeout(timeout);
-            clearTimeout(startupTimeout);
-            clearInterval(stallInterval);
+            if (startupTimeout) clearTimeout(startupTimeout);
+            if (stallInterval) clearInterval(stallInterval);
         };
         function markActivity() {
             sawAnyOutput = true;
             lastActivityAt = Date.now();
-            clearTimeout(startupTimeout);
+            if (startupTimeout) clearTimeout(startupTimeout);
             writeHeartbeat();
         }
         function failOnce(err) {
@@ -731,20 +731,21 @@ function statusText(userId) {
 // ===================================================================
 // BOT
 // ===================================================================
-const telegramRequestTimeoutMs = (typeof config.telegramRequestTimeoutMs === 'number' && config.telegramRequestTimeoutMs > 0)
+const telegramRequestTimeoutMs = (typeof config.telegramRequestTimeoutMs === 'number')
     ? config.telegramRequestTimeoutMs
-    : 60 * 1000;
-const bot = new TelegramBot(config.telegramToken, {
+    : 0;
+const botOptions = {
     polling: {
         params: {
             timeout: 30,
             allowed_updates: ['message', 'callback_query']
         }
-    },
-    request: {
-        timeout: telegramRequestTimeoutMs
     }
-});
+};
+if (telegramRequestTimeoutMs > 0) {
+    botOptions.request = { timeout: telegramRequestTimeoutMs };
+}
+const bot = new TelegramBot(config.telegramToken, botOptions);
 const isAllowed = (id) => Array.isArray(config.allowedUserIds) && config.allowedUserIds.includes(id);
 
 function ts() { return new Date().toISOString().slice(11, 19); }
