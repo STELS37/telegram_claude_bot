@@ -62,6 +62,8 @@ const BOT_ID = config.id || path.basename(configPath, '.json');
 const SESSIONS_FILE = path.join(__dirname, `sessions-${BOT_ID}.json`);
 const SETTINGS_FILE = path.join(__dirname, `user-settings-${BOT_ID}.json`);
 const PENDING_CHOICES_FILE = path.join(__dirname, `pending-choices-${BOT_ID}.json`);
+const PENDING_JOB_MESSAGES_FILE = path.join(__dirname, `pending-job-messages-${BOT_ID}.json`);
+const DEFERRED_QUEUE_FILE = path.join(__dirname, `deferred-queue-${BOT_ID}.json`);
 const INCOMING_DIR = path.join(__dirname, 'incoming', BOT_ID);
 const RUNS_DIR = path.join(__dirname, `runs-${BOT_ID}`);
 const CURRENT_JOBS_FILE = path.join(__dirname, `current-jobs-${BOT_ID}.json`);
@@ -542,6 +544,94 @@ setInterval(() => {
     if (changed) savePendingChoices();
 }, 30 * 60 * 1000);
 
+function loadPendingJobMessages() {
+    try {
+        const raw = JSON.parse(fs.readFileSync(PENDING_JOB_MESSAGES_FILE, 'utf8'));
+        return new Map(Object.entries(raw || {}));
+    } catch {
+        return new Map();
+    }
+}
+function savePendingJobMessages() {
+    fs.writeFileSync(PENDING_JOB_MESSAGES_FILE, JSON.stringify(Object.fromEntries(pendingJobMessages), null, 2));
+}
+
+// User messages sent while a Claude job is running wait for a button choice.
+const pendingJobMessages = loadPendingJobMessages();
+function createPendingJobMessage(userId, chatId, prompt, jobId) {
+    const id = crypto.randomBytes(4).toString('hex');
+    pendingJobMessages.set(id, {
+        userId,
+        chatId,
+        prompt,
+        jobId,
+        createdAt: Date.now()
+    });
+    savePendingJobMessages();
+    return id;
+}
+function takePendingJobMessage(id, userId) {
+    const item = pendingJobMessages.get(id);
+    if (!item || item.userId !== userId) return null;
+    pendingJobMessages.delete(id);
+    savePendingJobMessages();
+    return item;
+}
+
+const deferredQueue = loadDeferredQueue();
+function loadDeferredQueue() {
+    try { return JSON.parse(fs.readFileSync(DEFERRED_QUEUE_FILE, 'utf8')) || {}; }
+    catch { return {}; }
+}
+function saveDeferredQueue() {
+    writeJsonAtomic(DEFERRED_QUEUE_FILE, deferredQueue);
+}
+function normalizeQueueEntry(entry) {
+    return {
+        id: entry.id || crypto.randomBytes(5).toString('hex'),
+        userId: entry.userId,
+        chatId: entry.chatId,
+        prompt: entry.prompt || '',
+        sourceJobId: entry.sourceJobId || entry.jobId || null,
+        createdAt: entry.createdAt || Date.now(),
+        queuedAt: entry.queuedAt || Date.now()
+    };
+}
+function addDeferredMessage(entry, toFront = false) {
+    const normalized = normalizeQueueEntry(entry);
+    const key = String(normalized.userId);
+    if (!Array.isArray(deferredQueue[key])) deferredQueue[key] = [];
+    if (toFront) deferredQueue[key].unshift(normalized);
+    else deferredQueue[key].push(normalized);
+    saveDeferredQueue();
+    return normalized;
+}
+function shiftDeferredMessage(userId) {
+    const key = String(userId);
+    const list = Array.isArray(deferredQueue[key]) ? deferredQueue[key] : [];
+    const item = list.shift() || null;
+    if (list.length) deferredQueue[key] = list;
+    else delete deferredQueue[key];
+    saveDeferredQueue();
+    return item;
+}
+function countDeferredMessages(userId) {
+    const list = deferredQueue[String(userId)];
+    return Array.isArray(list) ? list.length : 0;
+}
+
+setInterval(() => {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    let changed = false;
+    for (const [k, v] of pendingJobMessages) {
+        if (!v || v.createdAt < cutoff) {
+            pendingJobMessages.delete(k);
+            changed = true;
+        }
+    }
+    if (changed) savePendingJobMessages();
+}, 30 * 60 * 1000);
+
 // ===================================================================
 // PROGRESS DISPLAY
 // ===================================================================
@@ -746,6 +836,8 @@ function helpText() {
         'В настройках есть «Показывать прогресс» — вижу каждый шаг (команда/чтение/поиск) в одном обновляемом сообщении.\n\n' +
         '*Вопросы от меня:*\n' +
         'Если мне нужно уточнение, я задам вопрос с кнопками — просто жми нужный вариант.\n\n' +
+        '*Сообщения во время работы:*\n' +
+        'Если напишешь во время активной задачи, я предложу кнопки: добавить как рекомендацию в текущую работу или поставить в очередь после завершения.\n\n' +
         '*Команды:*\n' +
         '/menu — главное меню\n' +
         '/new — новый диалог (сбросить контекст)\n' +
@@ -860,6 +952,7 @@ function jobDir(jobId) { return path.join(RUNS_DIR, jobId); }
 function jobFile(jobId) { return path.join(jobDir(jobId), 'job.json'); }
 function stateFile(jobId) { return path.join(jobDir(jobId), 'state.json'); }
 function eventsFile(jobId) { return path.join(jobDir(jobId), 'events.jsonl'); }
+function liveInputFile(jobId) { return path.join(jobDir(jobId), 'live-inputs.jsonl'); }
 
 function readJob(jobId) { return readJsonFile(jobFile(jobId), null); }
 function readJobState(jobId) { return readJsonFile(stateFile(jobId), null); }
@@ -868,6 +961,39 @@ function mergeJobState(jobId, patch) {
     const file = stateFile(jobId);
     const current = readJsonFile(file, {});
     writeJsonAtomic(file, { ...current, ...patch, updatedAt: new Date().toISOString() });
+}
+function appendJobEvent(jobId, event) {
+    fs.appendFileSync(eventsFile(jobId), JSON.stringify({
+        runner_ts: new Date().toISOString(),
+        ...event
+    }) + '\n');
+}
+
+function appendLiveInputToJob(jobId, entry) {
+    const text = String(entry.prompt || '').trim();
+    const now = new Date().toISOString();
+    const live = {
+        id: entry.id || crypto.randomBytes(5).toString('hex'),
+        userId: entry.userId,
+        chatId: entry.chatId,
+        text,
+        createdAt: entry.createdAt || Date.now(),
+        receivedAt: now
+    };
+    fs.appendFileSync(liveInputFile(jobId), JSON.stringify(live) + '\n');
+    appendJobEvent(jobId, {
+        type: 'user_live_input',
+        user_id: entry.userId,
+        text,
+        live_input_id: live.id
+    });
+    const state = readJobState(jobId) || {};
+    mergeJobState(jobId, {
+        liveInputCount: (state.liveInputCount || 0) + 1,
+        latestLiveInputAt: now,
+        latestLiveInputPreview: compactOneLine(text, 220)
+    });
+    return live;
 }
 
 function loadCurrentJobs() { return readJsonFile(CURRENT_JOBS_FILE, {}); }
@@ -910,9 +1036,59 @@ function formatAge(iso) {
     return `${hours} ч ${min % 60} мин`;
 }
 
+function pendingMessageKeyboard(id) {
+    return {
+        inline_keyboard: [
+            [{ text: '↪ В текущую работу', callback_data: `jobmsg:${id}:hint` }],
+            [{ text: '🕓 В очередь после', callback_data: `jobmsg:${id}:queue` }],
+            [{ text: '✕ Отменить', callback_data: `jobmsg:${id}:cancel` }]
+        ]
+    };
+}
+
+async function askActiveJobMessageAction(userId, chatId, prompt, current) {
+    const id = createPendingJobMessage(userId, chatId, prompt, current.jobId);
+    const state = current.state || {};
+    const queued = countDeferredMessages(userId);
+    const preview = compactOneLine(prompt, 700);
+    await bot.sendMessage(
+        chatId,
+        '⏳ Сейчас уже выполняется задача.\n' +
+        `Job: ${current.jobId}\n` +
+        `Статус: ${state.status || 'running'}\n` +
+        `Последняя активность: ${formatAge(state.lastActivityAt)} назад\n` +
+        (queued ? `Очередь после: ${queued}\n` : '') +
+        '\nЧто сделать с новым сообщением?\n\n' +
+        `«${preview}»`,
+        { reply_markup: pendingMessageKeyboard(id), disable_web_page_preview: true }
+    ).catch(() => {});
+}
+
+function startNextDeferredForUser(userId) {
+    if (getCurrentLiveJob(userId)) return false;
+    const entry = shiftDeferredMessage(userId);
+    if (!entry) return false;
+    enqueueForUser(userId, async () => {
+        if (getCurrentLiveJob(userId)) {
+            addDeferredMessage(entry, true);
+            return;
+        }
+        await bot.sendMessage(entry.chatId, `▶ Запускаю сообщение из очереди. Осталось в очереди: ${countDeferredMessages(userId)}`).catch(() => {});
+        await processUserMessage(userId, entry.chatId, entry.prompt, { fromDeferred: true, deferredEntry: entry });
+    });
+    return true;
+}
+
+function recoverDeferredQueues() {
+    for (const userId of Object.keys(deferredQueue)) {
+        startNextDeferredForUser(userId);
+    }
+}
+
 function currentJobStatusText(userId) {
+    const queued = countDeferredMessages(userId);
     const current = getCurrentLiveJob(userId);
-    if (!current) return '🧵 Активная задача: нет';
+    if (!current) return '🧵 Активная задача: нет' + (queued ? `\n🕓 Очередь после: ${queued}` : '');
     const { jobId, state } = current;
     const lastTool = state.lastTool
         ? `${state.lastTool.name || 'tool'}`
@@ -930,8 +1106,10 @@ function currentJobStatusText(userId) {
         `• Последняя активность: ${formatAge(state.lastActivityAt)} назад`,
         `• Событий Claude: ${state.eventCount || 0}`,
         `• Последний tool: ${lastTool}`,
+        `• Очередь после: ${queued}`,
+        state.latestLiveInputAt ? `• Последнее дополнение: ${formatAge(state.latestLiveInputAt)} назад` : null,
         `• Rate limit: ${rate}`
-    ].join('\n');
+    ].filter(Boolean).join('\n');
 }
 
 function systemdUnitNameForJob(jobId) {
@@ -993,9 +1171,11 @@ function startClaudeJob(userId, chatId, prompt, settings, sessionId) {
         settings,
         sessionId: sessionId || null,
         configPath,
+        liveInputPath: liveInputFile(jobId),
         createdAt: new Date().toISOString()
     };
     writeJsonAtomic(jobFile(jobId), job);
+    fs.closeSync(fs.openSync(liveInputFile(jobId), 'a'));
     writeJsonAtomic(stateFile(jobId), {
         jobId,
         botId: BOT_ID,
@@ -1047,6 +1227,9 @@ function readNewEvents(jobId, offset) {
 }
 
 function collectStepFromEvent(event) {
+    if (event && event.type === 'user_live_input') {
+        return [`📝 Дополнение пользователя: ${compactOneLine(event.text, 180)}`];
+    }
     if (!event || event.type !== 'assistant' || !event.message || !Array.isArray(event.message.content)) return [];
     const lines = [];
     for (const block of event.message.content) {
@@ -1314,6 +1497,7 @@ function startJobMonitor(jobId, options = {}) {
         } finally {
             clearCurrentJob(userId, jobId);
             activeJobMonitors.delete(jobId);
+            setImmediate(() => startNextDeferredForUser(userId));
         }
     }
 
@@ -1532,18 +1716,14 @@ bot.on('message', async (msg) => {
     b.timer = setTimeout(() => flushUserTextBatch(userId), TEXT_BATCH_FLUSH_MS);
 });
 
-async function processUserMessage(userId, chatId, prompt) {
+async function processUserMessage(userId, chatId, prompt, options = {}) {
     const current = getCurrentLiveJob(userId);
     if (current) {
-        const state = current.state;
-        await bot.sendMessage(
-            chatId,
-            `⏳ Уже выполняется job \`${current.jobId}\`.\n` +
-            `Статус: \`${state.status || 'running'}\`\n` +
-            `Последняя активность: ${formatAge(state.lastActivityAt)} назад\n\n` +
-            'Напиши /status, чтобы посмотреть детали, или /stop, чтобы прервать.',
-            { parse_mode: 'Markdown' }
-        ).catch(() => {});
+        if (options.fromDeferred) {
+            addDeferredMessage(options.deferredEntry || { userId, chatId, prompt, sourceJobId: current.jobId }, true);
+            return;
+        }
+        await askActiveJobMessageAction(userId, chatId, prompt, current);
         return;
     }
 
@@ -1821,6 +2001,56 @@ bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const msgId = query.message.message_id;
     try {
+        if (data.startsWith('jobmsg:')) {
+            const parts = data.split(':');
+            const pendingId = parts[1];
+            const action = parts[2];
+            const item = takePendingJobMessage(pendingId, userId);
+            if (!item) {
+                await answerCallback({ text: '⌛ Сообщение устарело или уже обработано', show_alert: false });
+                return;
+            }
+
+            if (action === 'cancel') {
+                await answerCallback({ text: 'Отменено' });
+                await bot.editMessageText('✕ Сообщение отменено.', { chat_id: chatId, message_id: msgId }).catch(() => {});
+                return;
+            }
+
+            if (action === 'queue') {
+                const queued = addDeferredMessage({ ...item, sourceJobId: item.jobId });
+                await answerCallback({ text: '✓ Поставлено в очередь' });
+                await bot.editMessageText(`🕓 Сообщение поставлено в очередь после текущей задачи.\nОчередь: ${countDeferredMessages(userId)}`, {
+                    chat_id: chatId, message_id: msgId
+                }).catch(() => {});
+                if (!getCurrentLiveJob(userId)) startNextDeferredForUser(userId);
+                log(`queued message ${queued.id} for ${userId} after active job`);
+                return;
+            }
+
+            if (action === 'hint') {
+                const current = getCurrentLiveJob(userId);
+                if (current) {
+                    appendLiveInputToJob(current.jobId, item);
+                    await answerCallback({ text: '✓ Добавлено в текущую работу' });
+                    await bot.editMessageText(`↪ Сообщение добавлено как рекомендация в текущую работу.\nJob: ${current.jobId}`, {
+                        chat_id: chatId, message_id: msgId
+                    }).catch(() => {});
+                    log(`live hint ${pendingId} added to job ${current.jobId} for ${userId}`);
+                } else {
+                    await answerCallback({ text: 'Текущая задача уже закончилась, запускаю сейчас' });
+                    await bot.editMessageText('▶ Текущая задача уже закончилась. Запускаю сообщение сейчас.', {
+                        chat_id: chatId, message_id: msgId
+                    }).catch(() => {});
+                    enqueueForUser(userId, async () => processUserMessage(userId, chatId, item.prompt, { fromDeferred: true }));
+                }
+                return;
+            }
+
+            await answerCallback({ text: 'Неизвестное действие', show_alert: false });
+            return;
+        }
+
         // Handle ASK button click
         if (data.startsWith('choice:')) {
             const parts = data.split(':');
@@ -1950,4 +2180,5 @@ console.log('Settings file:  ', SETTINGS_FILE);
 console.log('Incoming dir:   ', INCOMING_DIR);
 console.log('Runs dir:       ', RUNS_DIR);
 recoverActiveJobs();
+recoverDeferredQueues();
 console.log('Polling Telegram...');
