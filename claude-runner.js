@@ -73,6 +73,93 @@ function redactSensitiveText(text) {
         .replace(/((?:access|refresh)[_-]?token["']?\s*[:=]\s*["']?)[^"'\s,}]+/gi, '$1[redacted-token]');
 }
 
+function formatMoscowTime(isoValue) {
+    if (!isoValue) return null;
+    const date = new Date(isoValue);
+    if (!Number.isFinite(date.getTime())) return null;
+    try {
+        return new Intl.DateTimeFormat('ru-RU', {
+            timeZone: 'Europe/Moscow',
+            day: '2-digit',
+            month: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false
+        }).format(date) + ' МСК';
+    } catch {
+        return isoValue;
+    }
+}
+
+function percentText(value) {
+    return value === null || value === undefined ? '?' : String(value);
+}
+
+function formatQuotaReason(reason) {
+    const session = String(reason || '').match(/^session remaining ([0-9.]+)% < ([0-9.]+)%$/);
+    if (session) return `5h осталось ${session[1]}%, нужно минимум ${session[2]}%`;
+    const weekly = String(reason || '').match(/^weekly remaining ([0-9.]+)% < ([0-9.]+)%$/);
+    if (weekly) return `week осталось ${weekly[1]}%, нужно минимум ${weekly[2]}%`;
+    return String(reason || 'ниже резервов');
+}
+
+function buildOmniRouteQuotaStatusMessage() {
+    const rotatorPath = '/usr/local/sbin/omniroute-claude-quota-rotate.js';
+    if (!fs.existsSync(rotatorPath)) return '';
+    const dryRun = spawnSync(process.execPath, [rotatorPath, '--dry-run'], {
+        cwd: '/a0/usr/projects/omniroute',
+        env: { ...process.env },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 60 * 1000
+    });
+    const raw = redactSensitiveText([
+        dryRun.stdout ? dryRun.stdout.toString('utf8') : '',
+        dryRun.stderr ? dryRun.stderr.toString('utf8') : ''
+    ].join('\n')).trim();
+    if (!raw) return '';
+
+    let parsed = null;
+    try {
+        parsed = JSON.parse(raw);
+    } catch {
+        for (const line of raw.split(/\r?\n/).map(item => item.trim()).filter(Boolean)) {
+            try { parsed = JSON.parse(line); break; } catch {}
+        }
+    }
+    if (!parsed || !Array.isArray(parsed.accounts)) return '';
+
+    const thresholds = parsed.thresholds || {};
+    const accounts = parsed.accounts
+        .slice()
+        .sort((a, b) => {
+            const at = a.blockUntil ? new Date(a.blockUntil).getTime() : Number.MAX_SAFE_INTEGER;
+            const bt = b.blockUntil ? new Date(b.blockUntil).getTime() : Number.MAX_SAFE_INTEGER;
+            if (at !== bt) return at - bt;
+            return (b.score || 0) - (a.score || 0);
+        })
+        .slice(0, 5)
+        .map((account, index) => {
+            const waitUntil = formatMoscowTime(account.blockUntil);
+            const reason = Array.isArray(account.reasons) && account.reasons.length
+                ? account.reasons.map(formatQuotaReason).join('; ')
+                : 'ниже резервов';
+            return [
+                `${index + 1}. ${account.name || account.id || 'Claude account'}`,
+                `   5h остаток: ${percentText(account.session && account.session.remaining)}%, week остаток: ${percentText(account.weekly && account.weekly.remaining)}%`,
+                `   причина: ${reason}${waitUntil ? `; ближайшее освобождение: ${waitUntil}` : ''}`
+            ].join('\n');
+        });
+
+    return [
+        'OmniRoute сейчас не нашёл полноценный Claude OAuth-аккаунт выше резервов.',
+        `Пороги: 5h >= ${thresholds.sessionMinRemaining ?? 50}%, week >= ${thresholds.weeklyMinRemaining ?? 20}% остатка.`,
+        'Claude Code не был запущен на старых credentials, чтобы не ловить 429 и не тратить лимит впустую.',
+        '',
+        'Ближайшие варианты:',
+        ...accounts
+    ].join('\n');
+}
+
 function summarizeOauthSyncFailure(sync) {
     if (sync.error) return sync.error.message;
     const chunks = [];
@@ -85,7 +172,13 @@ function summarizeOauthSyncFailure(sync) {
     for (let i = lines.length - 1; i >= 0; i--) {
         try {
             const parsed = JSON.parse(lines[i]);
-            if (parsed && parsed.error) return String(parsed.error);
+            if (parsed && parsed.error) {
+                const errorText = String(parsed.error);
+                if (errorText.includes('No quota-eligible OmniRoute Claude connection found')) {
+                    return buildOmniRouteQuotaStatusMessage() || errorText;
+                }
+                return errorText;
+            }
         } catch {}
     }
     return lines.slice(-3).join(' | ');
