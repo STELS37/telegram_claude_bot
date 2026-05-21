@@ -229,6 +229,12 @@ function buildSystemPrompt(settings) {
         'Для простой диагностики предпочитай чтение файлов, логов, systemd, curl или API.'
     );
 
+    parts.push(
+        'ДОЛГИЕ ПРОЦЕССЫ И RUNTIME. Если нужно запустить сервер, daemon, watcher, runtime, bot, uvicorn/node/python service или любой процесс, который должен жить дольше 5-10 секунд, ' +
+        'НИКОГДА не запускай его как foreground-команду Bash. Запускай через systemd-run/nohup/setsid с логом в файл и сразу возвращай управление. ' +
+        'После запуска отдельной короткой командой проверь health/logs. Если нужно ждать внешний процесс (звонок, деплой, скан), делай короткие проверки по 5-15 секунд и между ними пиши пользователю статус.'
+    );
+
     if (settings.fullAccess) {
         parts.push(
             'ПАМЯТЬ БЕЗ ПОДТВЕРЖДЕНИЙ. Если нужно сохранить долговременную память/заметку Claude Code, пиши markdown-файлы в ' +
@@ -1055,13 +1061,37 @@ function collectThinkingFromEvent(event) {
     const hasToolUse = blocks.some(b => b.type === 'tool_use');
     const out = [];
     for (const block of blocks) {
-        if (block.type === 'text' && block.text && block.text.trim() && hasToolUse) {
-            out.push(['💭', block.text.trim()]);
+        if (block.type === 'text' && block.text && block.text.trim()) {
+            out.push([hasToolUse ? '💭' : '💬', block.text.trim()]);
         } else if (block.type === 'thinking' && block.thinking && block.thinking.trim()) {
             out.push(['🧠', block.thinking.trim()]);
         }
     }
     return out;
+}
+
+function normalizeLiveText(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+function isAlreadySentLiveText(text, sentLiveTexts) {
+    const normalized = normalizeLiveText(text);
+    if (!normalized) return false;
+    return sentLiveTexts.some(sent => sent === normalized);
+}
+
+function compactOneLine(text, max = 180) {
+    const s = String(text || '').replace(/\s+/g, ' ').trim();
+    return s.length > max ? s.slice(0, max - 1) + '…' : s;
+}
+
+function summarizeRunningTool(tool) {
+    if (!tool) return '';
+    const input = tool.input || {};
+    const name = tool.name || 'tool';
+    const detail = input.description || input.command || input.file_path || input.path || input.pattern || '';
+    const compact = compactOneLine(detail, 180);
+    return compact ? `${name} — ${compact}` : name;
 }
 
 const activeJobMonitors = new Map();
@@ -1122,6 +1152,8 @@ function startJobMonitor(jobId, options = {}) {
     let lastEdit = 0;
     let editScheduled = false;
     let thinkingQueue = Promise.resolve();
+    const sentLiveTexts = [];
+    let lastIdleStatusAt = 0;
 
     const EDIT_THROTTLE_MS = 2500;
     const MAX_STATUS_CHARS = 3500;
@@ -1144,6 +1176,9 @@ function startJobMonitor(jobId, options = {}) {
         lines.push('');
         lines.push(`Job: ${jobId}`);
         if (state && state.lastActivityAt) lines.push(`Последняя активность: ${formatAge(state.lastActivityAt)} назад`);
+        if (state && state.status === 'running' && state.lastTool) {
+            lines.push(`Сейчас выполняется: ${summarizeRunningTool(state.lastTool)}`);
+        }
         if (finalLine) lines.push('', finalLine);
         return lines.join('\n');
     }
@@ -1167,6 +1202,8 @@ function startJobMonitor(jobId, options = {}) {
     }
 
     function sendThinking(prefix, fullText) {
+        const normalized = normalizeLiveText(fullText);
+        if (normalized) sentLiveTexts.push(normalized);
         thinkingQueue = thinkingQueue.then(async () => {
             await sendRichMessage(chatId, prefix + ' ' + fullText);
         }).catch(() => {});
@@ -1202,7 +1239,9 @@ function startJobMonitor(jobId, options = {}) {
                 const afterAsks = extractAsks(afterFiles.text);
                 const cleanText = afterAsks.text;
 
-                if (cleanText.trim()) await sendRichMessage(chatId, cleanText);
+                if (cleanText.trim() && !isAlreadySentLiveText(cleanText, sentLiveTexts)) {
+                    await sendRichMessage(chatId, cleanText);
+                }
                 for (const filePath of afterFiles.files) {
                     try {
                         if (!fs.existsSync(filePath)) {
@@ -1297,6 +1336,13 @@ function startJobMonitor(jobId, options = {}) {
             }
             const state = readJobState(jobId);
             if (!state) return;
+            if (settings.showProgress && statusMsgId && state.status === 'running') {
+                const now = Date.now();
+                if (now - lastIdleStatusAt > 15000) {
+                    lastIdleStatusAt = now;
+                    refreshStatus();
+                }
+            }
             if (['done', 'error', 'stopped'].includes(state.status) && !state.deliveredAt) {
                 clearInterval(pollInterval);
                 clearInterval(typingInterval);
@@ -1605,7 +1651,10 @@ async function processUserMessageLegacy(userId, chatId, prompt) {
 
     // Queue thinking messages so they appear in order
     let thinkingQueue = Promise.resolve();
+    const sentLiveTexts = [];
     function sendThinking(prefix, fullText) {
+        const normalized = normalizeLiveText(fullText);
+        if (normalized) sentLiveTexts.push(normalized);
         thinkingQueue = thinkingQueue.then(async () => {
             await sendRichMessage(chatId, prefix + ' ' + fullText);
         });
@@ -1627,10 +1676,7 @@ async function processUserMessageLegacy(userId, chatId, prompt) {
                             refreshStatus();
                         } else if (block.type === 'text' && block.text && block.text.trim()) {
                             const text = block.text.trim();
-                            // Промежуточные мысли (текст вместе с tool_use) — шлём отдельным сообщением целиком.
-                            if (hasToolUse) {
-                                sendThinking('💭', text);
-                            }
+                            sendThinking(hasToolUse ? '💭' : '💬', text);
                         } else if (block.type === 'thinking' && block.thinking && block.thinking.trim()) {
                             sendThinking('🧠', block.thinking.trim());
                         }
@@ -1682,7 +1728,7 @@ async function processUserMessageLegacy(userId, chatId, prompt) {
             } catch (e) { /* ignore */ }
         }
 
-        if (cleanText.trim()) {
+        if (cleanText.trim() && !isAlreadySentLiveText(cleanText, sentLiveTexts)) {
             await sendRichMessage(chatId, cleanText);
         }
         for (const filePath of files) {

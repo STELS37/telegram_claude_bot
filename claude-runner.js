@@ -233,6 +233,12 @@ function buildSystemPrompt(config, settings) {
         'Для простой диагностики предпочитай чтение файлов, логов, systemd, curl или API.'
     );
 
+    parts.push(
+        'ДОЛГИЕ ПРОЦЕССЫ И RUNTIME. Если нужно запустить сервер, daemon, watcher, runtime, bot, uvicorn/node/python service или любой процесс, который должен жить дольше 5-10 секунд, ' +
+        'НИКОГДА не запускай его как foreground-команду Bash. Запускай через systemd-run/nohup/setsid с логом в файл и сразу возвращай управление. ' +
+        'После запуска отдельной короткой командой проверь health/logs. Если нужно ждать внешний процесс (звонок, деплой, скан), делай короткие проверки по 5-15 секунд и между ними пиши пользователю статус.'
+    );
+
     if (settings.fullAccess) {
         parts.push(
             'ПАМЯТЬ БЕЗ ПОДТВЕРЖДЕНИЙ. Если нужно сохранить долговременную память/заметку Claude Code, пиши markdown-файлы в ' +
@@ -304,6 +310,26 @@ function summarizeTool(event) {
     return null;
 }
 
+function resultErrorMessage(event, stderrBuf) {
+    return event.result || event.message || event.error || event.api_error_status || tailText(stderrBuf, 2000) || 'Claude API error unknown';
+}
+
+function terminalStateFromResult(event, observedSessionId, stderrBuf, extra = {}) {
+    const isError = !!event.is_error;
+    const patch = {
+        ...extra,
+        status: isError ? 'error' : 'done',
+        finishedAt: extra.finishedAt || new Date().toISOString(),
+        resultEvent: event,
+        result: event.result || event.message || '',
+        session_id: event.session_id || observedSessionId || null,
+        observedSessionId,
+        api_error_status: event.api_error_status || null
+    };
+    if (isError) patch.error = resultErrorMessage(event, stderrBuf);
+    return patch;
+}
+
 const job = readJson(jobFile, null);
 if (!job) {
     console.error(`Job file not found or invalid: ${jobFile}`);
@@ -320,6 +346,7 @@ let stderrBuf = '';
 let lastResultEvent = null;
 let observedSessionId = null;
 let eventCount = 0;
+let terminalStateWritten = false;
 
 function stopChild(signal = 'SIGTERM') {
     if (!proc || !proc.pid) return;
@@ -393,7 +420,19 @@ try {
                 eventCount += 1;
                 if (event.session_id && !observedSessionId) observedSessionId = event.session_id;
                 if (event.type === 'system' && event.session_id) observedSessionId = event.session_id;
-                if (event.type === 'result') lastResultEvent = event;
+                if (event.type === 'result') {
+                    lastResultEvent = event;
+                    if (!terminalStateWritten) {
+                        terminalStateWritten = true;
+                        mergeState(terminalStateFromResult(event, observedSessionId, stderrBuf, {
+                            resultReadyAt: new Date().toISOString()
+                        }));
+                        setTimeout(() => {
+                            const latest = readJson(stateFile, {});
+                            if (latest.status === 'done' || latest.status === 'error') stopChild('SIGTERM');
+                        }, 1500).unref();
+                    }
+                }
                 appendEvent(event);
                 const lastTool = summarizeTool(event);
                 const patch = {
@@ -444,6 +483,14 @@ try {
             stderrTail: tailText(stderrBuf),
             stdoutTail: tailText(stdoutBuf)
         };
+        if (terminalStateWritten) {
+            mergeState({
+                ...base,
+                status: current.status || (lastResultEvent && lastResultEvent.is_error ? 'error' : 'done'),
+                processClosedAt: new Date().toISOString()
+            });
+            return;
+        }
         if (stopRequested) {
             mergeState({
                 ...base,
