@@ -8,8 +8,6 @@ node_modules/
 sessions*.json
 user-settings*.json
 pending-choices*.json
-pending-job-messages*.json
-deferred-queue*.json
 current-jobs*.json
 incoming/
 crash-dumps/
