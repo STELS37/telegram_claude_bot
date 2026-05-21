@@ -837,7 +837,7 @@ function helpText() {
         '*Вопросы от меня:*\n' +
         'Если мне нужно уточнение, я задам вопрос с кнопками — просто жми нужный вариант.\n\n' +
         '*Сообщения во время работы:*\n' +
-        'Если напишешь во время активной задачи, я предложу кнопки: добавить как рекомендацию в текущую работу или поставить в очередь после завершения.\n\n' +
+        'Если напишешь во время активной задачи, я предложу кнопки: добавить как рекомендацию в текущую работу с контрольным follow-up или поставить отдельным сообщением в очередь после завершения.\n\n' +
         '*Команды:*\n' +
         '/menu — главное меню\n' +
         '/new — новый диалог (сбросить контекст)\n' +
@@ -1039,7 +1039,7 @@ function formatAge(iso) {
 function pendingMessageKeyboard(id) {
     return {
         inline_keyboard: [
-            [{ text: '↪ В текущую работу', callback_data: `jobmsg:${id}:hint` }],
+            [{ text: '↪ В текущую + контроль', callback_data: `jobmsg:${id}:hint` }],
             [{ text: '🕓 В очередь после', callback_data: `jobmsg:${id}:queue` }],
             [{ text: '✕ Отменить', callback_data: `jobmsg:${id}:cancel` }]
         ]
@@ -1066,7 +1066,8 @@ async function askActiveJobMessageAction(userId, chatId, prompt, current) {
         `Статус: ${state.status || 'running'}\n` +
         `Последняя активность: ${formatAge(state.lastActivityAt)} назад\n` +
         (queued ? `Очередь после: ${queued}\n` : '') +
-        '\nЧто сделать с новым сообщением?\n\n' +
+        '\nЧто сделать с новым сообщением?\n' +
+        'Вариант «в текущую» кладёт заметку в live-inbox и ставит контроль после завершения, чтобы она точно не потерялась.\n\n' +
         `«${preview}»`,
         { reply_markup: pendingMessageKeyboard(id), disable_web_page_preview: true }
     ).catch(() => {});
