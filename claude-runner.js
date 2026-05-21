@@ -66,6 +66,31 @@ function tailText(text, max = 12000) {
     return text.length > max ? text.slice(-max) : text;
 }
 
+function redactSensitiveText(text) {
+    return String(text || '')
+        .replace(/sk-ant-[A-Za-z0-9_-]+/g, '[redacted-token]')
+        .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, '$1[redacted-token]')
+        .replace(/((?:access|refresh)[_-]?token["']?\s*[:=]\s*["']?)[^"'\s,}]+/gi, '$1[redacted-token]');
+}
+
+function summarizeOauthSyncFailure(sync) {
+    if (sync.error) return sync.error.message;
+    const chunks = [];
+    if (sync.stdout) chunks.push(sync.stdout.toString('utf8'));
+    if (sync.stderr) chunks.push(sync.stderr.toString('utf8'));
+    const text = redactSensitiveText(chunks.join('\n')).trim();
+    if (!text) return `exit ${sync.status}`;
+
+    const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+            const parsed = JSON.parse(lines[i]);
+            if (parsed && parsed.error) return String(parsed.error);
+        } catch {}
+    }
+    return lines.slice(-3).join(' | ');
+}
+
 function sleepSync(ms) {
     const view = new Int32Array(new SharedArrayBuffer(4));
     Atomics.wait(view, 0, 0, ms);
@@ -139,11 +164,13 @@ function prepareClaudeLaunch(config) {
                 const sync = spawnSync(process.execPath, [OAUTH_SYNC_PATH, '--quiet'], {
                     cwd: config.workdir || '/root',
                     env: { ...process.env },
-                    stdio: 'ignore',
+                    stdio: ['ignore', 'pipe', 'pipe'],
                     timeout: 60 * 1000
                 });
-                if (sync.status !== 0) warnings.push(`oauth sync exited ${sync.status}`);
-                if (sync.error) warnings.push(`oauth sync error: ${sync.error.message}`);
+                if (sync.error || sync.status !== 0) {
+                    const reason = summarizeOauthSyncFailure(sync);
+                    throw new Error(`OmniRoute OAuth sync failed: ${reason}`);
+                }
             } else {
                 warnings.push('oauth sync script missing');
             }
