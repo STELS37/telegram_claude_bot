@@ -1046,6 +1046,14 @@ function pendingMessageKeyboard(id) {
     };
 }
 
+function liveHintFollowupPrompt(item, jobId) {
+    const text = String(item.prompt || '').trim();
+    return 'Во время предыдущей активной задачи пользователь отправил уточнение кнопкой «В текущую работу».\n\n' +
+        `Активный job тогда был: ${jobId}.\n` +
+        'Уточнение пользователя:\n' + text + '\n\n' +
+        'Проверь результат предыдущей задачи и текущие изменения. Если это уже учтено — коротко подтверди. ' +
+        'Если не учтено — сразу исправь/продолжи с учетом этого уточнения.';
+}
 async function askActiveJobMessageAction(userId, chatId, prompt, current) {
     const id = createPendingJobMessage(userId, chatId, prompt, current.jobId);
     const state = current.state || {};
@@ -2032,11 +2040,18 @@ bot.on('callback_query', async (query) => {
                 const current = getCurrentLiveJob(userId);
                 if (current) {
                     appendLiveInputToJob(current.jobId, item);
-                    await answerCallback({ text: '✓ Добавлено в текущую работу' });
-                    await bot.editMessageText(`↪ Сообщение добавлено как рекомендация в текущую работу.\nJob: ${current.jobId}`, {
+                    const safety = addDeferredMessage({
+                        ...item,
+                        id: undefined,
+                        kind: 'live-hint-safety',
+                        sourceJobId: current.jobId,
+                        prompt: liveHintFollowupPrompt(item, current.jobId)
+                    });
+                    await answerCallback({ text: '✓ Добавлено + контроль после' });
+                    await bot.editMessageText(`↪ Сообщение добавлено как рекомендация в текущую работу.\nJob: ${current.jobId}\n\n🕓 Контрольный follow-up поставлен в очередь, чтобы уточнение точно не потерялось. Очередь: ${countDeferredMessages(userId)}`, {
                         chat_id: chatId, message_id: msgId
                     }).catch(() => {});
-                    log(`live hint ${pendingId} added to job ${current.jobId} for ${userId}`);
+                    log(`live hint ${pendingId} added to job ${current.jobId} for ${userId}; safety queued ${safety.id}`);
                 } else {
                     await answerCallback({ text: 'Текущая задача уже закончилась, запускаю сейчас' });
                     await bot.editMessageText('▶ Текущая задача уже закончилась. Запускаю сообщение сейчас.', {
