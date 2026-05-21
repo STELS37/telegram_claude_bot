@@ -8,9 +8,11 @@ node_modules/
 sessions*.json
 user-settings*.json
 pending-choices*.json
+current-jobs*.json
 incoming/
 crash-dumps/
 state-backups/
+runs-*/
 npm-debug.log*
 package-lock.json.tmp
 

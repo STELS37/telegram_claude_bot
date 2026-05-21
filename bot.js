@@ -2,6 +2,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 // ===================================================================
 // CONFIG
@@ -62,6 +63,9 @@ const SESSIONS_FILE = path.join(__dirname, `sessions-${BOT_ID}.json`);
 const SETTINGS_FILE = path.join(__dirname, `user-settings-${BOT_ID}.json`);
 const PENDING_CHOICES_FILE = path.join(__dirname, `pending-choices-${BOT_ID}.json`);
 const INCOMING_DIR = path.join(__dirname, 'incoming', BOT_ID);
+const RUNS_DIR = path.join(__dirname, `runs-${BOT_ID}`);
+const CURRENT_JOBS_FILE = path.join(__dirname, `current-jobs-${BOT_ID}.json`);
+const CLAUDE_RUNNER_PATH = path.join(__dirname, 'claude-runner.js');
 
 // One-time migration from old single-bot file names ONLY for the "main" bot.
 // Любой другой бот стартует с пустыми файлами — иначе все боты подхватят
@@ -86,6 +90,7 @@ if (!config.claudePath || !fs.existsSync(config.claudePath)) {
 if (!Array.isArray(config.allowedUserIds)) config.allowedUserIds = [];
 if (!fs.existsSync(config.workdir)) fs.mkdirSync(config.workdir, { recursive: true });
 if (!fs.existsSync(INCOMING_DIR)) fs.mkdirSync(INCOMING_DIR, { recursive: true });
+if (!fs.existsSync(RUNS_DIR)) fs.mkdirSync(RUNS_DIR, { recursive: true });
 
 function writeHeartbeat() {
     if (!config.heartbeatPath) return;
@@ -725,7 +730,8 @@ function statusText(userId) {
         `• Контекст: ${s.rememberContext ? 'да' : 'нет'}\n` +
         `• Полный доступ: ${s.fullAccess ? 'да' : 'нет'}\n` +
         `• Веб-поиск: ${s.webSearch ? 'да' : 'нет'}\n` +
-        `• Прогресс: ${s.showProgress ? 'да' : 'нет'}`;
+        `• Прогресс: ${s.showProgress ? 'да' : 'нет'}\n\n` +
+        currentJobStatusText(userId);
 }
 
 // ===================================================================
@@ -791,6 +797,427 @@ function killProcessTree(proc) {
             try { process.kill(-proc.pid, 'SIGKILL'); }
             catch (e) { try { proc.kill('SIGKILL'); } catch {} }
         }, 1500);
+    }
+}
+
+// ===================================================================
+// PERSISTENT CLAUDE JOBS
+// ===================================================================
+function readJsonFile(file, fallback = {}) {
+    try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+    catch { return fallback; }
+}
+
+function writeJsonAtomic(file, value) {
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(value, null, 2));
+    fs.renameSync(tmp, file);
+}
+
+function makeJobId(userId) {
+    const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+    const suffix = crypto.randomBytes(4).toString('hex');
+    return `${BOT_ID}-${userId}-${stamp}-${suffix}`;
+}
+
+function jobDir(jobId) { return path.join(RUNS_DIR, jobId); }
+function jobFile(jobId) { return path.join(jobDir(jobId), 'job.json'); }
+function stateFile(jobId) { return path.join(jobDir(jobId), 'state.json'); }
+function eventsFile(jobId) { return path.join(jobDir(jobId), 'events.jsonl'); }
+
+function readJob(jobId) { return readJsonFile(jobFile(jobId), null); }
+function readJobState(jobId) { return readJsonFile(stateFile(jobId), null); }
+
+function mergeJobState(jobId, patch) {
+    const file = stateFile(jobId);
+    const current = readJsonFile(file, {});
+    writeJsonAtomic(file, { ...current, ...patch, updatedAt: new Date().toISOString() });
+}
+
+function loadCurrentJobs() { return readJsonFile(CURRENT_JOBS_FILE, {}); }
+function saveCurrentJobs(jobs) { writeJsonAtomic(CURRENT_JOBS_FILE, jobs); }
+function setCurrentJob(userId, jobId) {
+    const jobs = loadCurrentJobs();
+    jobs[String(userId)] = jobId;
+    saveCurrentJobs(jobs);
+}
+function clearCurrentJob(userId, jobId) {
+    const jobs = loadCurrentJobs();
+    const key = String(userId);
+    if (!jobId || jobs[key] === jobId) {
+        delete jobs[key];
+        saveCurrentJobs(jobs);
+    }
+}
+
+function isJobLive(state) {
+    return !!state && ['queued', 'starting', 'running', 'stopping', 'sending'].includes(state.status);
+}
+
+function getCurrentLiveJob(userId) {
+    const jobId = loadCurrentJobs()[String(userId)];
+    if (!jobId) return null;
+    const state = readJobState(jobId);
+    if (isJobLive(state)) return { jobId, state };
+    return null;
+}
+
+function formatAge(iso) {
+    if (!iso) return 'нет';
+    const ms = Date.now() - new Date(iso).getTime();
+    if (!Number.isFinite(ms) || ms < 0) return 'нет';
+    const sec = Math.floor(ms / 1000);
+    if (sec < 60) return `${sec} сек`;
+    const min = Math.floor(sec / 60);
+    if (min < 60) return `${min} мин ${sec % 60} сек`;
+    const hours = Math.floor(min / 60);
+    return `${hours} ч ${min % 60} мин`;
+}
+
+function currentJobStatusText(userId) {
+    const current = getCurrentLiveJob(userId);
+    if (!current) return '🧵 Активная задача: нет';
+    const { jobId, state } = current;
+    const lastTool = state.lastTool
+        ? `${state.lastTool.name || 'tool'}`
+        : 'нет';
+    const rate = state.lastRateLimit
+        ? `${state.lastRateLimit.status || '?'} / ${state.lastRateLimit.rateLimitType || '?'}`
+        : 'нет';
+    return [
+        '🧵 Активная задача: да',
+        `• Job: \`${jobId}\``,
+        `• Статус: \`${state.status || 'unknown'}\``,
+        `• PID runner/Claude: \`${state.runnerPid || '-'}\` / \`${state.claudePid || '-'}\``,
+        `• Работает: ${formatAge(state.startedAt)}`,
+        `• Последняя активность: ${formatAge(state.lastActivityAt)} назад`,
+        `• Событий Claude: ${state.eventCount || 0}`,
+        `• Последний tool: ${lastTool}`,
+        `• Rate limit: ${rate}`
+    ].join('\n');
+}
+
+function startClaudeJob(userId, chatId, prompt, settings, sessionId) {
+    const jobId = makeJobId(userId);
+    const dir = jobDir(jobId);
+    fs.mkdirSync(dir, { recursive: true });
+    const job = {
+        jobId,
+        botId: BOT_ID,
+        userId,
+        chatId,
+        prompt,
+        settings,
+        sessionId: sessionId || null,
+        configPath,
+        createdAt: new Date().toISOString()
+    };
+    writeJsonAtomic(jobFile(jobId), job);
+    writeJsonAtomic(stateFile(jobId), {
+        jobId,
+        botId: BOT_ID,
+        userId,
+        chatId,
+        status: 'starting',
+        createdAt: job.createdAt,
+        updatedAt: job.createdAt
+    });
+
+    const runner = spawn(process.execPath, [CLAUDE_RUNNER_PATH, dir, configPath], {
+        shell: false,
+        cwd: __dirname,
+        detached: process.platform !== 'win32',
+        stdio: 'ignore',
+        env: { ...process.env }
+    });
+    runner.unref();
+    mergeJobState(jobId, { runnerPid: runner.pid, status: 'starting' });
+    setCurrentJob(userId, jobId);
+    return jobId;
+}
+
+function readNewEvents(jobId, offset) {
+    const file = eventsFile(jobId);
+    if (!fs.existsSync(file)) return { events: [], offset };
+    const size = fs.statSync(file).size;
+    if (offset > size) offset = 0;
+    if (size === offset) return { events: [], offset };
+    const fd = fs.openSync(file, 'r');
+    try {
+        const buf = Buffer.alloc(size - offset);
+        fs.readSync(fd, buf, 0, buf.length, offset);
+        const events = [];
+        for (const line of buf.toString('utf8').split('\n')) {
+            if (!line.trim()) continue;
+            try { events.push(JSON.parse(line)); } catch {}
+        }
+        return { events, offset: size };
+    } finally {
+        fs.closeSync(fd);
+    }
+}
+
+function collectStepFromEvent(event) {
+    if (!event || event.type !== 'assistant' || !event.message || !Array.isArray(event.message.content)) return [];
+    const lines = [];
+    for (const block of event.message.content) {
+        if (block.type === 'tool_use') lines.push(describeToolUse(block.name, block.input));
+    }
+    return lines;
+}
+
+function collectThinkingFromEvent(event) {
+    if (!event || event.type !== 'assistant' || !event.message || !Array.isArray(event.message.content)) return [];
+    const blocks = event.message.content;
+    const hasToolUse = blocks.some(b => b.type === 'tool_use');
+    const out = [];
+    for (const block of blocks) {
+        if (block.type === 'text' && block.text && block.text.trim() && hasToolUse) {
+            out.push(['💭', block.text.trim()]);
+        } else if (block.type === 'thinking' && block.thinking && block.thinking.trim()) {
+            out.push(['🧠', block.thinking.trim()]);
+        }
+    }
+    return out;
+}
+
+const activeJobMonitors = new Map();
+
+function stopActiveJobForUser(userId) {
+    const current = getCurrentLiveJob(userId);
+    if (!current) return null;
+    const { jobId, state } = current;
+    mergeJobState(jobId, { status: 'stopping', stopRequestedAt: new Date().toISOString() });
+    const targets = [state.claudePid, state.runnerPid].filter(Boolean);
+    for (const pid of targets) {
+        try { process.kill(-pid, 'SIGTERM'); }
+        catch { try { process.kill(pid, 'SIGTERM'); } catch {} }
+    }
+    setTimeout(() => {
+        const latest = readJobState(jobId);
+        if (!latest || !['stopping', 'running'].includes(latest.status)) return;
+        for (const pid of targets) {
+            try { process.kill(-pid, 'SIGKILL'); }
+            catch { try { process.kill(pid, 'SIGKILL'); } catch {} }
+        }
+    }, 5000).unref();
+    return { jobId, state };
+}
+
+function startJobMonitor(jobId, options = {}) {
+    if (activeJobMonitors.has(jobId)) return;
+    const job = readJob(jobId);
+    if (!job) return;
+    activeJobMonitors.set(jobId, true);
+
+    const chatId = job.chatId;
+    const userId = job.userId;
+    const settings = job.settings || getUserSettings(userId);
+    let statusMsgId = options.statusMsgId || null;
+    let eventOffset = options.replayFromStart ? 0 : (fs.existsSync(eventsFile(jobId)) ? fs.statSync(eventsFile(jobId)).size : 0);
+    const steps = [];
+    let lastEdit = 0;
+    let editScheduled = false;
+    let thinkingQueue = Promise.resolve();
+
+    const EDIT_THROTTLE_MS = 2500;
+    const MAX_STATUS_CHARS = 3500;
+
+    function renderStatus(finalLine = '') {
+        let total = 0;
+        const lines = [];
+        for (let i = steps.length - 1; i >= 0; i--) {
+            const line = steps[i];
+            const add = line.length + 1;
+            if (total + add > MAX_STATUS_CHARS) {
+                lines.unshift(`… (${i + 1} ранее)`);
+                break;
+            }
+            total += add;
+            lines.unshift(line);
+        }
+        const state = readJobState(jobId);
+        if (!lines.length) lines.push('🤔 Думаю…');
+        lines.push('');
+        lines.push(`Job: ${jobId}`);
+        if (state && state.lastActivityAt) lines.push(`Последняя активность: ${formatAge(state.lastActivityAt)} назад`);
+        if (finalLine) lines.push('', finalLine);
+        return lines.join('\n');
+    }
+
+    async function refreshStatus(force = false) {
+        if (!statusMsgId) return;
+        const now = Date.now();
+        if (!force && now - lastEdit < EDIT_THROTTLE_MS) {
+            if (editScheduled) return;
+            editScheduled = true;
+            setTimeout(() => { editScheduled = false; refreshStatus(true).catch(() => {}); }, EDIT_THROTTLE_MS - (now - lastEdit));
+            return;
+        }
+        lastEdit = now;
+        try {
+            await bot.editMessageText(renderStatus(), {
+                chat_id: chatId, message_id: statusMsgId,
+                disable_web_page_preview: true
+            });
+        } catch {}
+    }
+
+    function sendThinking(prefix, fullText) {
+        thinkingQueue = thinkingQueue.then(async () => {
+            await sendRichMessage(chatId, prefix + ' ' + fullText);
+        }).catch(() => {});
+    }
+
+    async function deliverFinal(state) {
+        mergeJobState(jobId, { telegramStatus: 'sending', sendingAt: new Date().toISOString() });
+        await thinkingQueue.catch(() => {});
+        try {
+            if (state.status === 'done') {
+                const sessions = loadSessions();
+                const sid = state.session_id || state.observedSessionId;
+                if (sid && settings.rememberContext) {
+                    sessions[userId] = sid;
+                    saveSessions(sessions);
+                }
+
+                if (statusMsgId) {
+                    try {
+                        if (steps.length === 0) {
+                            await bot.deleteMessage(chatId, statusMsgId);
+                        } else {
+                            await bot.editMessageText(renderStatus('✅ Готово'), {
+                                chat_id: chatId, message_id: statusMsgId,
+                                disable_web_page_preview: true
+                            });
+                        }
+                    } catch {}
+                }
+
+                const rawText = state.result || (state.resultEvent && (state.resultEvent.result || state.resultEvent.message)) || '';
+                const afterFiles = extractFilesToSend(rawText);
+                const afterAsks = extractAsks(afterFiles.text);
+                const cleanText = afterAsks.text;
+
+                if (cleanText.trim()) await sendRichMessage(chatId, cleanText);
+                for (const filePath of afterFiles.files) {
+                    try {
+                        if (!fs.existsSync(filePath)) {
+                            await bot.sendMessage(chatId, `⚠ Файл не найден: \`${filePath}\``, { parse_mode: 'Markdown' });
+                            continue;
+                        }
+                        const stats = fs.statSync(filePath);
+                        if (stats.size > 50 * 1024 * 1024) {
+                            await bot.sendMessage(chatId, `⚠ Файл больше 50 МБ: \`${filePath}\``, { parse_mode: 'Markdown' });
+                            continue;
+                        }
+                        await bot.sendChatAction(chatId, 'upload_document').catch(() => {});
+                        await bot.sendDocument(chatId, filePath, {}, { filename: path.basename(filePath) });
+                    } catch (e) {
+                        await bot.sendMessage(chatId, `⚠ Ошибка отправки: ${e.message.slice(0, 200)}`);
+                    }
+                }
+
+                for (const ask of afterAsks.asks) {
+                    const choiceId = createPendingChoice(userId, ask.options);
+                    const keyboard = {
+                        inline_keyboard: ask.options.map((opt, i) => [{
+                            text: opt.length > 60 ? opt.slice(0, 57) + '…' : opt,
+                            callback_data: `choice:${choiceId}:${i}`
+                        }])
+                    };
+                    await bot.sendMessage(chatId, '❓ ' + ask.question, { reply_markup: keyboard }).catch(e => {
+                        console.error('send ASK failed:', e.message);
+                    });
+                }
+                log(`job ${jobId} delivered, session=${String(state.session_id || '').slice(0, 8)}…`);
+            } else if (state.status === 'stopped') {
+                if (statusMsgId) {
+                    try {
+                        await bot.editMessageText(renderStatus('⛔ Прервано пользователем'), {
+                            chat_id: chatId, message_id: statusMsgId,
+                            disable_web_page_preview: true
+                        });
+                    } catch {}
+                }
+                await bot.sendMessage(chatId, '⛔ Текущий запрос и все дочерние процессы прерваны.').catch(() => {});
+            } else {
+                if (statusMsgId) {
+                    try {
+                        await bot.editMessageText(renderStatus('⚠ Ошибка'), {
+                            chat_id: chatId, message_id: statusMsgId,
+                            disable_web_page_preview: true
+                        });
+                    } catch {}
+                }
+                const errMsg = state.error || 'Claude job failed';
+                const sid = state.observedSessionId;
+                if (sid && settings.rememberContext) {
+                    const sessions = loadSessions();
+                    sessions[userId] = sid;
+                    saveSessions(sessions);
+                }
+                const hint = sid ? '\n\nℹ Сессия сохранена. Просто напиши «продолжай» — попробую с того же места.' : '';
+                for (const chunk of splitForTelegram('⚠ Ошибка:\n' + errMsg + hint, config.maxMessageLength || 3800)) {
+                    await bot.sendMessage(chatId, chunk).catch(() => {});
+                }
+            }
+            mergeJobState(jobId, { telegramStatus: 'delivered', deliveredAt: new Date().toISOString() });
+        } catch (err) {
+            mergeJobState(jobId, { telegramStatus: 'delivery_error', deliveryError: err.message });
+            throw err;
+        } finally {
+            clearCurrentJob(userId, jobId);
+            activeJobMonitors.delete(jobId);
+        }
+    }
+
+    const typingInterval = setInterval(() => bot.sendChatAction(chatId, 'typing').catch(() => {}), 4000);
+    const pollInterval = setInterval(async () => {
+        try {
+            writeHeartbeat();
+            const read = readNewEvents(jobId, eventOffset);
+            eventOffset = read.offset;
+            for (const event of read.events) {
+                if (settings.showProgress) {
+                    for (const line of collectStepFromEvent(event)) {
+                        steps.push(line);
+                        refreshStatus();
+                    }
+                    for (const [prefix, text] of collectThinkingFromEvent(event)) {
+                        sendThinking(prefix, text);
+                    }
+                }
+            }
+            const state = readJobState(jobId);
+            if (!state) return;
+            if (['done', 'error', 'stopped'].includes(state.status) && !state.deliveredAt) {
+                clearInterval(pollInterval);
+                clearInterval(typingInterval);
+                await deliverFinal(state);
+            }
+        } catch (err) {
+            log(`job monitor error for ${jobId}:`, err.message);
+        }
+    }, 2000);
+
+    pollInterval.unref();
+    typingInterval.unref();
+}
+
+function recoverActiveJobs() {
+    for (const [userId, jobId] of Object.entries(loadCurrentJobs())) {
+        const state = readJobState(jobId);
+        if (!state) {
+            clearCurrentJob(userId, jobId);
+            continue;
+        }
+        if (['done', 'error', 'stopped'].includes(state.status) && state.deliveredAt) {
+            clearCurrentJob(userId, jobId);
+            continue;
+        }
+        startJobMonitor(jobId, { replayFromStart: false });
+        log(`recovered job monitor ${jobId}, status=${state.status}`);
     }
 }
 
@@ -861,15 +1288,22 @@ bot.on('message', async (msg) => {
             bot.sendMessage(chatId, '✓ Новый диалог.'); return;
         }
         if (msg.text === '/stop') {
-            const proc = userActiveClaude.get(userId);
-            if (proc) {
+            const stoppedJob = stopActiveJobForUser(userId);
+            if (stoppedJob) {
                 markRecentlyStopped(userId);
-                killProcessTree(proc);
-                userActiveClaude.delete(userId);
-                bot.sendMessage(chatId, '⛔ Остановлено. Текущий запрос и все его дочерние процессы прерваны.');
-                log(`/stop by ${userId} — killed PID tree ${proc.pid}`);
+                bot.sendMessage(chatId, `⛔ Останавливаю job \`${stoppedJob.jobId}\`.`, { parse_mode: 'Markdown' });
+                log(`/stop by ${userId} — stopping job ${stoppedJob.jobId}`);
             } else {
-                bot.sendMessage(chatId, 'Сейчас ничего не выполняется.');
+                const proc = userActiveClaude.get(userId);
+                if (proc) {
+                    markRecentlyStopped(userId);
+                    killProcessTree(proc);
+                    userActiveClaude.delete(userId);
+                    bot.sendMessage(chatId, '⛔ Остановлено. Текущий запрос и все его дочерние процессы прерваны.');
+                    log(`/stop by ${userId} — killed legacy PID tree ${proc.pid}`);
+                } else {
+                    bot.sendMessage(chatId, 'Сейчас ничего не выполняется.');
+                }
             }
             return;
         }
@@ -947,6 +1381,57 @@ bot.on('message', async (msg) => {
 });
 
 async function processUserMessage(userId, chatId, prompt) {
+    const current = getCurrentLiveJob(userId);
+    if (current) {
+        const state = current.state;
+        await bot.sendMessage(
+            chatId,
+            `⏳ Уже выполняется job \`${current.jobId}\`.\n` +
+            `Статус: \`${state.status || 'running'}\`\n` +
+            `Последняя активность: ${formatAge(state.lastActivityAt)} назад\n\n` +
+            'Напиши /status, чтобы посмотреть детали, или /stop, чтобы прервать.',
+            { parse_mode: 'Markdown' }
+        ).catch(() => {});
+        return;
+    }
+
+    const startTs = Date.now();
+    const settings = getUserSettings(userId);
+    const sessions = loadSessions();
+    const existingSession = sessions[userId];
+    const useResume = settings.rememberContext && !!existingSession;
+    const fullPrompt = buildPromptPrefix(settings, !useResume) + prompt;
+
+    log(`create job for ${userId}, session=${existingSession ? existingSession.slice(0, 8) + '…' : 'NEW'}, fullAccess=${settings.fullAccess}`);
+    bot.sendChatAction(chatId, 'typing').catch(() => {});
+
+    let statusMsgId = null;
+    if (settings.showProgress) {
+        try {
+            const m = await bot.sendMessage(chatId, '🤔 Думаю…');
+            statusMsgId = m.message_id;
+        } catch {}
+    }
+
+    try {
+        const jobId = startClaudeJob(userId, chatId, fullPrompt, settings, useResume ? existingSession : null);
+        log(`job ${jobId} started for ${userId} in ${Math.round((Date.now() - startTs) / 1000)}s`);
+        startJobMonitor(jobId, { statusMsgId, replayFromStart: true });
+    } catch (err) {
+        if (statusMsgId) {
+            try {
+                await bot.editMessageText('⚠ Не удалось запустить Claude job', {
+                    chat_id: chatId, message_id: statusMsgId,
+                    disable_web_page_preview: true
+                });
+            } catch {}
+        }
+        log(`job create ERROR for ${userId}:`, err.message);
+        await bot.sendMessage(chatId, '⚠ Не удалось запустить задачу:\n' + String(err.message || err)).catch(() => {});
+    }
+}
+
+async function processUserMessageLegacy(userId, chatId, prompt) {
     const startTs = Date.now();
     const settings = getUserSettings(userId);
     const sessions = loadSessions();
@@ -1240,16 +1725,24 @@ bot.on('callback_query', async (query) => {
             await answerCallback({ text: '✓ Контекст сброшен' });
             await bot.sendMessage(chatId, '✓ Новый диалог.'); return;
         } else if (data === 'cmd:stop') {
-            const proc = userActiveClaude.get(userId);
-            if (proc) {
+            const stoppedJob = stopActiveJobForUser(userId);
+            if (stoppedJob) {
                 markRecentlyStopped(userId);
-                killProcessTree(proc);
-                userActiveClaude.delete(userId);
-                await answerCallback({ text: '⛔ Остановлено' });
-                await bot.sendMessage(chatId, '⛔ Текущий запрос и все дочерние процессы прерваны.');
-                log(`/stop by ${userId} via button — killed PID tree ${proc.pid}`);
+                await answerCallback({ text: '⛔ Останавливаю' });
+                await bot.sendMessage(chatId, `⛔ Останавливаю job \`${stoppedJob.jobId}\`.`, { parse_mode: 'Markdown' });
+                log(`/stop by ${userId} via button — stopping job ${stoppedJob.jobId}`);
             } else {
-                await answerCallback({ text: 'Ничего не выполняется', show_alert: false });
+                const proc = userActiveClaude.get(userId);
+                if (proc) {
+                    markRecentlyStopped(userId);
+                    killProcessTree(proc);
+                    userActiveClaude.delete(userId);
+                    await answerCallback({ text: '⛔ Остановлено' });
+                    await bot.sendMessage(chatId, '⛔ Текущий запрос и все дочерние процессы прерваны.');
+                    log(`/stop by ${userId} via button — killed legacy PID tree ${proc.pid}`);
+                } else {
+                    await answerCallback({ text: 'Ничего не выполняется', show_alert: false });
+                }
             }
             return;
         } else if (data === 'cmd:status') {
@@ -1303,4 +1796,6 @@ console.log('Workdir:        ', config.workdir);
 console.log('Sessions file:  ', SESSIONS_FILE);
 console.log('Settings file:  ', SETTINGS_FILE);
 console.log('Incoming dir:   ', INCOMING_DIR);
+console.log('Runs dir:       ', RUNS_DIR);
+recoverActiveJobs();
 console.log('Polling Telegram...');
