@@ -1,5 +1,5 @@
 const TelegramBot = require('node-telegram-bot-api');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -889,12 +889,59 @@ function currentJobStatusText(userId) {
         `• Job: \`${jobId}\``,
         `• Статус: \`${state.status || 'unknown'}\``,
         `• PID runner/Claude: \`${state.runnerPid || '-'}\` / \`${state.claudePid || '-'}\``,
+        `• Unit: \`${state.systemdUnit || '-'}\``,
         `• Работает: ${formatAge(state.startedAt)}`,
         `• Последняя активность: ${formatAge(state.lastActivityAt)} назад`,
         `• Событий Claude: ${state.eventCount || 0}`,
         `• Последний tool: ${lastTool}`,
         `• Rate limit: ${rate}`
     ].join('\n');
+}
+
+function systemdUnitNameForJob(jobId) {
+    return `claude-tg-job-${String(jobId).replace(/[^A-Za-z0-9_.-]/g, '-')}`.slice(0, 180);
+}
+
+function canUseSystemdRun() {
+    return process.platform !== 'win32'
+        && process.env.CLAUDE_RUNNER_SYSTEMD !== '0'
+        && fs.existsSync('/run/systemd/system');
+}
+
+function startRunnerWithSystemd(jobId, dir) {
+    if (!canUseSystemdRun()) return false;
+    const unitName = systemdUnitNameForJob(jobId);
+    const args = [
+        `--unit=${unitName}`,
+        '--collect',
+        '--property=Type=simple',
+        `--property=WorkingDirectory=${__dirname}`,
+        '--property=KillMode=control-group',
+        '--property=Restart=no',
+        process.execPath,
+        CLAUDE_RUNNER_PATH,
+        dir,
+        configPath
+    ];
+    const result = spawnSync('systemd-run', args, {
+        cwd: __dirname,
+        env: { ...process.env },
+        encoding: 'utf8',
+        timeout: 10000
+    });
+    if (result.status !== 0) {
+        mergeJobState(jobId, {
+            runnerLaunchMode: 'detached-fallback',
+            systemdRunError: (result.stderr || result.stdout || `exit ${result.status}`).trim().slice(0, 2000)
+        });
+        return false;
+    }
+    mergeJobState(jobId, {
+        runnerLaunchMode: 'systemd-run',
+        systemdUnit: `${unitName}.service`,
+        systemdRunOutput: (result.stdout || '').trim().slice(0, 1000)
+    });
+    return true;
 }
 
 function startClaudeJob(userId, chatId, prompt, settings, sessionId) {
@@ -923,15 +970,21 @@ function startClaudeJob(userId, chatId, prompt, settings, sessionId) {
         updatedAt: job.createdAt
     });
 
-    const runner = spawn(process.execPath, [CLAUDE_RUNNER_PATH, dir, configPath], {
-        shell: false,
-        cwd: __dirname,
-        detached: process.platform !== 'win32',
-        stdio: 'ignore',
-        env: { ...process.env }
-    });
-    runner.unref();
-    mergeJobState(jobId, { runnerPid: runner.pid, status: 'starting' });
+    if (!startRunnerWithSystemd(jobId, dir)) {
+        const runner = spawn(process.execPath, [CLAUDE_RUNNER_PATH, dir, configPath], {
+            shell: false,
+            cwd: __dirname,
+            detached: process.platform !== 'win32',
+            stdio: 'ignore',
+            env: { ...process.env }
+        });
+        runner.unref();
+        mergeJobState(jobId, {
+            runnerPid: runner.pid,
+            status: 'starting',
+            runnerLaunchMode: 'detached'
+        });
+    }
     setCurrentJob(userId, jobId);
     return jobId;
 }
@@ -987,7 +1040,17 @@ function stopActiveJobForUser(userId) {
     const current = getCurrentLiveJob(userId);
     if (!current) return null;
     const { jobId, state } = current;
-    mergeJobState(jobId, { status: 'stopping', stopRequestedAt: new Date().toISOString() });
+    mergeJobState(jobId, {
+        status: 'stopping',
+        stopRequestedAt: new Date().toISOString(),
+        stopRequestedBy: 'telegram'
+    });
+    if (state.systemdUnit) {
+        spawn('systemctl', ['kill', '--signal=SIGTERM', '--kill-whom=all', state.systemdUnit], {
+            shell: false,
+            stdio: 'ignore'
+        }).unref();
+    }
     const targets = [state.claudePid, state.runnerPid].filter(Boolean);
     for (const pid of targets) {
         try { process.kill(-pid, 'SIGTERM'); }
@@ -996,6 +1059,16 @@ function stopActiveJobForUser(userId) {
     setTimeout(() => {
         const latest = readJobState(jobId);
         if (!latest || !['stopping', 'running'].includes(latest.status)) return;
+        if (latest.systemdUnit) {
+            spawn('systemctl', ['kill', '--signal=SIGKILL', '--kill-whom=all', latest.systemdUnit], {
+                shell: false,
+                stdio: 'ignore'
+            }).unref();
+            spawn('systemctl', ['stop', latest.systemdUnit], {
+                shell: false,
+                stdio: 'ignore'
+            }).unref();
+        }
         for (const pid of targets) {
             try { process.kill(-pid, 'SIGKILL'); }
             catch { try { process.kill(pid, 'SIGKILL'); } catch {} }

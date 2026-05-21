@@ -299,13 +299,26 @@ function stopChild(signal = 'SIGTERM') {
     }
 }
 
-process.on('SIGTERM', () => {
-    mergeState({ status: 'stopping', stopRequestedAt: new Date().toISOString(), stopSignal: 'SIGTERM' });
+function handleExternalSignal(signal) {
+    const current = readJson(stateFile, {});
+    const patch = {
+        status: 'stopping',
+        stopSignal: signal,
+        signalReceivedAt: new Date().toISOString()
+    };
+    if (!current.stopRequestedAt) {
+        patch.externalSignal = signal;
+        patch.externalSignalAt = patch.signalReceivedAt;
+    }
+    mergeState(patch);
     stopChild('SIGTERM');
+}
+
+process.on('SIGTERM', () => {
+    handleExternalSignal('SIGTERM');
 });
 process.on('SIGINT', () => {
-    mergeState({ status: 'stopping', stopRequestedAt: new Date().toISOString(), stopSignal: 'SIGINT' });
-    stopChild('SIGTERM');
+    handleExternalSignal('SIGINT');
 });
 
 try {
@@ -391,7 +404,8 @@ try {
 
     proc.on('close', (code, signal) => {
         const current = readJson(stateFile, {});
-        const stopRequested = !!current.stopRequestedAt;
+        const stopRequested = !!current.stopRequestedAt && !!current.stopRequestedBy;
+        const externalSignal = !stopRequested && current.externalSignal;
         const base = {
             finishedAt: new Date().toISOString(),
             exitCode: code,
@@ -405,6 +419,14 @@ try {
                 ...base,
                 status: 'stopped',
                 error: `Claude stopped by user${signal ? ` (${signal})` : ''}`
+            });
+        } else if (externalSignal) {
+            mergeState({
+                ...base,
+                status: 'error',
+                error: `Claude interrupted by external ${externalSignal}`,
+                externalSignal,
+                signalReceivedAt: current.signalReceivedAt || null
             });
         } else if (!lastResultEvent) {
             mergeState({
