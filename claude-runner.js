@@ -91,16 +91,76 @@ function formatMoscowTime(isoValue) {
     }
 }
 
+function formatDurationRu(ms) {
+    if (!Number.isFinite(ms)) return '';
+    if (ms <= 0) return 'сейчас';
+    const minutes = Math.ceil(ms / 60000);
+    if (minutes < 60) return 'через ' + minutes + ' мин';
+    const hours = Math.floor(minutes / 60);
+    const rest = minutes % 60;
+    if (hours < 24) return 'через ' + hours + ' ч' + (rest ? ' ' + rest + ' мин' : '');
+    const days = Math.floor(hours / 24);
+    const dayHours = hours % 24;
+    return 'через ' + days + ' д' + (dayHours ? ' ' + dayHours + ' ч' : '');
+}
+
+function formatFutureMoscowTime(isoValue) {
+    const formatted = formatMoscowTime(isoValue);
+    if (!formatted) return null;
+    const ms = new Date(isoValue).getTime();
+    const rel = formatDurationRu(ms - Date.now());
+    return rel ? formatted + ' (' + rel + ')' : formatted;
+}
+
 function percentText(value) {
     return value === null || value === undefined ? '?' : String(value);
 }
 
-function formatQuotaReason(reason) {
-    const session = String(reason || '').match(/^session remaining ([0-9.]+)% < ([0-9.]+)%$/);
-    if (session) return `5h осталось ${session[1]}%, нужно минимум ${session[2]}%`;
-    const weekly = String(reason || '').match(/^weekly remaining ([0-9.]+)% < ([0-9.]+)%$/);
-    if (weekly) return `week осталось ${weekly[1]}%, нужно минимум ${weekly[2]}%`;
-    return String(reason || 'ниже резервов');
+function quotaWindowLabel(windowKey) {
+    const text = String(windowKey || '').toLowerCase();
+    if (text.includes('5h') || text.includes('session')) return '5ч';
+    if (text.includes('7d') || text.includes('weekly')) return '7д';
+    return windowKey || 'лимит';
+}
+
+function windowLine(status) {
+    const label = quotaWindowLabel(status && status.window);
+    const remaining = percentText(status && status.remaining);
+    const threshold = percentText(status && status.thresholdRemaining);
+    const ok = status && !status.thresholdReached;
+    return label + ': ' + remaining + '% / минимум ' + threshold + '%' + (ok ? ' - ок' : ' - ниже резерва');
+}
+
+function snapshotAgeText(snapshotAt) {
+    if (!snapshotAt) return '';
+    const ms = Date.now() - new Date(snapshotAt).getTime();
+    if (!Number.isFinite(ms) || ms < 0) return '';
+    const age = formatDurationRu(ms).replace(/^через /, '');
+    const suffix = ms > 20 * 60 * 1000 ? ' (данные старые)' : '';
+    return 'обновлено ' + age + ' назад' + suffix;
+}
+
+function blockingWindows(account) {
+    return [account && account.session, account && account.weekly]
+        .filter((status) => status && status.thresholdReached);
+}
+
+function availabilityFromBlockingWindows(account) {
+    const blockers = blockingWindows(account);
+    const resetTimes = blockers
+        .map((status) => ({ status, ms: status.resetAt ? new Date(status.resetAt).getTime() : null }))
+        .filter((item) => Number.isFinite(item.ms) && item.ms > Date.now())
+        .sort((a, b) => b.ms - a.ms);
+    if (resetTimes.length > 0) return { iso: resetTimes[0].status.resetAt, source: quotaWindowLabel(resetTimes[0].status.window) + ' resetAt' };
+    if (account && account.blockUntil) return { iso: account.blockUntil, source: 'внутренняя блокировка OmniRoute' };
+    return { iso: null, source: null };
+}
+
+function shortAccountName(account) {
+    const name = account && account.name ? String(account.name) : '';
+    if (name && name !== account.id) return name;
+    const id = account && account.id ? String(account.id) : '';
+    return id ? 'Без названия (' + id.slice(0, 8) + ')' : 'Claude account';
 }
 
 function buildOmniRouteQuotaStatusMessage() {
@@ -132,30 +192,38 @@ function buildOmniRouteQuotaStatusMessage() {
     const accounts = parsed.accounts
         .slice()
         .sort((a, b) => {
-            const at = a.blockUntil ? new Date(a.blockUntil).getTime() : Number.MAX_SAFE_INTEGER;
-            const bt = b.blockUntil ? new Date(b.blockUntil).getTime() : Number.MAX_SAFE_INTEGER;
+            const aa = availabilityFromBlockingWindows(a).iso;
+            const bb = availabilityFromBlockingWindows(b).iso;
+            const at = aa ? new Date(aa).getTime() : Number.MAX_SAFE_INTEGER;
+            const bt = bb ? new Date(bb).getTime() : Number.MAX_SAFE_INTEGER;
             if (at !== bt) return at - bt;
             return (b.score || 0) - (a.score || 0);
         })
         .slice(0, 5)
         .map((account, index) => {
-            const waitUntil = formatMoscowTime(account.blockUntil);
-            const reason = Array.isArray(account.reasons) && account.reasons.length
-                ? account.reasons.map(formatQuotaReason).join('; ')
-                : 'ниже резервов';
+            const availability = availabilityFromBlockingWindows(account);
+            const availableAt = formatFutureMoscowTime(availability.iso);
+            const blockers = blockingWindows(account);
+            const snapshotAges = blockers
+                .map((status) => snapshotAgeText(status.snapshotAt))
+                .filter(Boolean);
+            const sourceLine = availability.source
+                ? '   время: по ' + availability.source + (snapshotAges.length ? '; ' + snapshotAges.join(', ') : '')
+                : '   время: точный resetAt не найден, нужен refresh лимитов';
             return [
-                `${index + 1}. ${account.name || account.id || 'Claude account'}`,
-                `   5h остаток: ${percentText(account.session && account.session.remaining)}%, week остаток: ${percentText(account.weekly && account.weekly.remaining)}%`,
-                `   причина: ${reason}${waitUntil ? `; ближайшее освобождение: ${waitUntil}` : ''}`
+                String(index + 1) + '. ' + shortAccountName(account),
+                '   ' + windowLine(account.session) + '; ' + windowLine(account.weekly),
+                '   пройдёт наше правило: ' + (availableAt || 'после обновления лимитов'),
+                sourceLine
             ].join('\n');
         });
 
     return [
-        'OmniRoute сейчас не нашёл полноценный Claude OAuth-аккаунт выше резервов.',
-        `Пороги: 5h >= ${thresholds.sessionMinRemaining ?? 50}%, week >= ${thresholds.weeklyMinRemaining ?? 20}% остатка.`,
-        'Claude Code не был запущен на старых credentials, чтобы не ловить 429 и не тратить лимит впустую.',
+        'Нет доступного Claude-аккаунта для Opus 4.7 по резервам OmniRoute.',
+        'Правило: 5ч >= ' + (thresholds.sessionMinRemaining ?? 50) + '%, 7д >= ' + (thresholds.weeklyMinRemaining ?? 20) + '% остатка.',
+        'Claude Code не запущен на старых credentials, чтобы не получить 429 и не тратить лимит впустую.',
         '',
-        'Ближайшие варианты:',
+        'Аккаунты и ближайшее прохождение правила:',
         ...accounts
     ].join('\n');
 }
@@ -262,7 +330,7 @@ function prepareClaudeLaunch(config) {
                 });
                 if (sync.error || sync.status !== 0) {
                     const reason = summarizeOauthSyncFailure(sync);
-                    throw new Error(`OmniRoute OAuth sync failed: ${reason}`);
+                    throw new Error(reason);
                 }
             } else {
                 warnings.push('oauth sync script missing');
