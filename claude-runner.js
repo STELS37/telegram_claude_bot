@@ -340,22 +340,24 @@ function linkClaudeProjects(destClaudeDir, warnings) {
 
 function importClaudeOAuthBack(home) {
     if (!home || !fs.existsSync(OAUTH_IMPORT_PATH)) return null;
-    const sync = spawnSync(process.execPath, [OAUTH_IMPORT_PATH, '--home', home, '--quiet'], {
-        cwd: config.workdir || '/root',
-        env: { ...process.env },
-        stdio: ['ignore', 'pipe', 'pipe'],
-        timeout: 60 * 1000
+    return withFileLock('/tmp/claude-oauth-sync.lock', () => {
+        const sync = spawnSync(process.execPath, [OAUTH_IMPORT_PATH, '--home', home, '--quiet'], {
+            cwd: config.workdir || '/root',
+            env: { ...process.env },
+            stdio: ['ignore', 'pipe', 'pipe'],
+            timeout: 60 * 1000
+        });
+        const output = redactSensitiveText([
+            sync.stdout ? sync.stdout.toString('utf8') : '',
+            sync.stderr ? sync.stderr.toString('utf8') : ''
+        ].join('\n')).trim();
+        return {
+            status: sync.status,
+            ok: !sync.error && sync.status === 0,
+            error: sync.error ? sync.error.message : null,
+            output: output.slice(-1000)
+        };
     });
-    const output = redactSensitiveText([
-        sync.stdout ? sync.stdout.toString('utf8') : '',
-        sync.stderr ? sync.stderr.toString('utf8') : ''
-    ].join('\n')).trim();
-    return {
-        status: sync.status,
-        ok: !sync.error && sync.status === 0,
-        error: sync.error ? sync.error.message : null,
-        output: output.slice(-1000)
-    };
 }
 
 function prepareClaudeLaunch(config) {

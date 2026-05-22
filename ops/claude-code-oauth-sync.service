@@ -1,0 +1,11 @@
+[Unit]
+Description=Claude OAuth steward for OmniRoute and Claude Code
+Wants=network-online.target
+After=network-online.target omniroute.service claude-telegram-bot.service claude-telegram-bot-parallel.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/a0/usr/projects/omniroute
+ExecStart=/usr/local/sbin/claude-oauth-steward.sh
+Nice=5

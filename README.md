@@ -48,6 +48,18 @@ For a second Telegram bot with an independent Claude session and user state, run
 
 The included `claude-telegram-bot-parallel.service` keeps its own heartbeat, sessions, settings, uploads, and pending inline choices under the `linux2` bot id.
 
+## Claude OAuth Steward
+
+Production uses a dedicated OAuth steward for OmniRoute/Claude Code token hygiene. It keeps the generic OmniRoute Claude health-check disabled because Claude OAuth refresh tokens are rotating and single-use. The steward still provides health monitoring, recovers refreshed tokens from completed bot runs, and refreshes the selected Claude account only when no Claude Code job is active.
+
+Installed production paths:
+
+```text
+/usr/local/sbin/claude-oauth-health-report.js
+/usr/local/sbin/claude-oauth-steward.sh
+/etc/systemd/system/claude-code-oauth-sync.service
+```
+
 ## Safety
 
 Do not commit:
