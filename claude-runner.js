@@ -384,7 +384,7 @@ function prepareClaudeLaunch(config) {
 
         withFileLock('/tmp/claude-oauth-sync.lock', () => {
             if (fs.existsSync(OAUTH_SYNC_PATH)) {
-                const sync = spawnSync(process.execPath, [OAUTH_SYNC_PATH, '--quiet'], {
+                const sync = spawnSync(process.execPath, [OAUTH_SYNC_PATH, '--quiet', '--mark-use'], {
                     cwd: config.workdir || '/root',
                     env: { ...process.env },
                     stdio: ['ignore', 'pipe', 'pipe'],

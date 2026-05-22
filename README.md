@@ -52,11 +52,16 @@ The included `claude-telegram-bot-parallel.service` keeps its own heartbeat, ses
 
 Production uses a dedicated OAuth steward for OmniRoute/Claude Code token hygiene. It keeps the generic OmniRoute Claude health-check disabled because Claude OAuth refresh tokens are rotating and single-use. The steward still provides health monitoring, recovers refreshed tokens from completed bot runs, and refreshes the selected Claude account only when no Claude Code job is active.
 
+
+The Claude account picker is intentionally stateful for bot jobs: `claude-runner.js` calls the OAuth sync script with `--mark-use`, so real bot runs update `last_used_at` and `consecutive_use_count`. Background steward checks do not mark usage. The rotator then prefers quota-eligible accounts with fresh reset/headroom while penalizing very recent consecutive use, which keeps the bot from sticking to one account when another account has just recovered.
+
 Installed production paths:
 
 ```text
 /usr/local/sbin/claude-oauth-health-report.js
 /usr/local/sbin/claude-oauth-steward.sh
+/usr/local/sbin/omniroute-claude-quota-rotate.js
+/usr/local/sbin/sync-omniroute-claude-code-oauth.js
 /etc/systemd/system/claude-code-oauth-sync.service
 ```
 
