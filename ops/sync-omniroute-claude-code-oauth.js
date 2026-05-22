@@ -16,6 +16,12 @@ const LONG_LIVED_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
 const FORCE = process.argv.includes('--force');
 const QUIET = process.argv.includes('--quiet');
 const MARK_USE = process.argv.includes('--mark-use') || process.env.CLAUDE_ROTATE_MARK_USE === '1';
+const DEFAULT_SCOPES = Object.freeze([
+  'user:inference',
+  'user:profile',
+  'user:mcp_servers',
+  'user:sessions:claude_code',
+]);
 
 function log(obj) {
   if (!QUIET) console.log(JSON.stringify(obj));
@@ -24,7 +30,7 @@ function log(obj) {
 function parseEnv(p) {
   const out = {};
   for (const line of fs.readFileSync(p, 'utf8').split(/\r?\n/)) {
-    const m = line.match(/^s*([A-Za-z_][A-Za-z0-9_]*)s*=s*(.*)s*$/);
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
     if (!m) continue;
     let v = m[2].trim();
     if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
@@ -44,6 +50,20 @@ function classify(tok) {
 function hashToken(value) {
   if (!value) return null;
   return crypto.createHash('sha256').update(String(value)).digest('hex');
+}
+
+function normalizeScopes(value) {
+  const raw = Array.isArray(value) ? value : String(value || '').split(/[\s,]+/);
+  const out = [];
+  for (const item of raw) {
+    const parts = String(item || '').split(/[\s,]+/);
+    for (const part of parts) {
+      const scope = part.trim();
+      if (!scope || !scope.startsWith('user:')) continue;
+      if (!out.includes(scope)) out.push(scope);
+    }
+  }
+  return out;
 }
 
 function loadDb() {
@@ -141,15 +161,11 @@ function writeClaudeCredentials(accessToken, refreshToken, expiresAtMs, scopes) 
       refreshToken,
       expiresAt: expiresAtMs,
       scopes:
-        scopes && scopes.length
-          ? scopes
-          : old.scopes || [
-              'user:inference',
-              'user:profile',
-              'user:sessions:read',
-              'user:sessions:write',
-              'user:sessions:claude_code',
-            ],
+        normalizeScopes(scopes).length
+          ? normalizeScopes(scopes)
+          : normalizeScopes(old.scopes).length
+            ? normalizeScopes(old.scopes)
+            : [...DEFAULT_SCOPES],
       subscriptionType: old.subscriptionType || 'max',
       rateLimitTier: old.rateLimitTier || 'max',
     },
@@ -220,7 +236,7 @@ function selectConnection(db) {
   let refreshToken = decrypt(row.refresh_token);
   let expiresAtMs = row.expires_at ? new Date(row.expires_at).getTime() : 0;
   let scopeText = row.scope || '';
-  let scopes = scopeText ? String(scopeText).split(/[s,]+/).filter(Boolean) : [];
+  let scopes = normalizeScopes(scopeText);
   let remainingMs = Number.isFinite(expiresAtMs) ? expiresAtMs - Date.now() : -1;
   let refreshed = false;
   let authMethod = isLongLivedAccessOnly(row, accessToken, refreshToken) ? 'long_lived_access_token' : 'oauth_refresh';
@@ -244,7 +260,7 @@ function selectConnection(db) {
       expiresAtMs = Date.now() + expiresIn * 1000;
       remainingMs = expiresAtMs - Date.now();
       scopeText = tokens.scope || scopeText || scopes.join(' ');
-      scopes = scopeText ? String(scopeText).split(/[s,]+/).filter(Boolean) : scopes;
+      scopes = normalizeScopes(scopeText).length ? normalizeScopes(scopeText) : scopes;
       db.prepare(
         `UPDATE provider_connections
             SET access_token = ?,
