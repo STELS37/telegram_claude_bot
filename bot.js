@@ -917,6 +917,15 @@ function isOmniRouteQuotaNotice(text) {
         || value.includes('No quota-eligible OmniRoute Claude connection');
 }
 
+function isTransientClaudeApiError(text, state = {}) {
+    const value = String(text || '');
+    const status = Number(state.api_error_status || (state.resultEvent && state.resultEvent.api_error_status));
+    return (Number.isFinite(status) && status >= 500 && status < 600)
+        || /API Error:\s*5\d\d/i.test(value)
+        || value.includes('Internal server error')
+        || value.includes('server_error');
+}
+
 function currentJobStatusText(userId) {
     const current = getCurrentLiveJob(userId);
     if (!current) return '🧵 Активная задача: нет';
@@ -1294,6 +1303,9 @@ function startJobMonitor(jobId, options = {}) {
                 }
                 await bot.sendMessage(chatId, '⛔ Текущий запрос и все дочерние процессы прерваны.').catch(() => {});
             } else {
+                const errMsg = state.error || 'Claude job failed';
+                const quotaNotice = isOmniRouteQuotaNotice(errMsg);
+                const transientApiError = isTransientClaudeApiError(errMsg, state);
                 if (statusMsgId) {
                     try {
                         await bot.editMessageText(renderStatus(quotaNotice ? '⏳ Лимиты Claude' : '⚠ Ошибка'), {
@@ -1302,18 +1314,23 @@ function startJobMonitor(jobId, options = {}) {
                         });
                     } catch {}
                 }
-                const errMsg = state.error || 'Claude job failed';
-                const quotaNotice = isOmniRouteQuotaNotice(errMsg);
                 const resumeMissing = String(state.error || '').includes('No conversation found with session ID');
                 const sid = resumeMissing
                     ? (state.sessionId || null)
                     : (state.session_id || state.observedSessionId || state.sessionId || null);
                 if (sid && settings.rememberContext) {
                     const sessions = loadSessions();
-                    sessions[userId] = sid;
+                    if (transientApiError && state.sessionId && sid === state.sessionId) {
+                        delete sessions[userId];
+                        log(`dropped failed resume session for ${userId}: ${String(sid).slice(0, 8)}… after transient Claude API error`);
+                    } else {
+                        sessions[userId] = sid;
+                    }
                     saveSessions(sessions);
                 }
-                const hint = !quotaNotice && sid ? '\n\nℹ Сессия сохранена. Просто напиши «продолжай» — попробую с того же места.' : '';
+                const hint = !quotaNotice && transientApiError && state.sessionId
+                    ? '\n\nℹ Похоже, зависла текущая Claude-сессия. Я сбросил её; следующий запрос пойдёт с нового контекста.'
+                    : (!quotaNotice && sid ? '\n\nℹ Сессия сохранена. Просто напиши «продолжай» — попробую с того же места.' : '');
                 const prefix = quotaNotice ? '' : '⚠ Ошибка:\n';
                 for (const chunk of splitForTelegram(prefix + errMsg + hint, config.maxMessageLength || 3800)) {
                     await bot.sendMessage(chatId, chunk).catch(() => {});
