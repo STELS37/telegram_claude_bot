@@ -7,7 +7,7 @@
   "claudePath": "/usr/bin/claude",
   "claudeOfficialPath": "/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
   "isolateClaudeHome": true,
-  "claudeModel": "cc/claude-opus-4-7[1m]",
+  "claudeModel": "claude-opus-4-7[1m]",
   "maxMessageLength": 3800,
   "claudeTimeoutMs": 0,
   "claudeStartupTimeoutMs": 0,

@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Direct Claude Code wrapper for Hermes/bots.
+# It keeps Claude Code on official Claude auth while letting OmniRoute choose
+# which stored Claude credential should be exported before launch.
+set -euo pipefail
+
+unset ANTHROPIC_API_KEY
+unset ANTHROPIC_BASE_URL
+unset ANTHROPIC_CUSTOM_HEADERS
+unset CLAUDE_CODE_USE_BEDROCK
+unset CLAUDE_CODE_USE_VERTEX
+unset CLAUDE_CODE_OAUTH_TOKEN
+
+export HOME=/root
+export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-max}"
+export CLAUDE_CODE_ALWAYS_ENABLE_EFFORT="${CLAUDE_CODE_ALWAYS_ENABLE_EFFORT:-1}"
+
+runtime_env=/root/.claude/.omniroute-runtime-env.json
+
+/usr/bin/node /usr/local/sbin/sync-omniroute-claude-code-oauth.js --quiet >/dev/null 2>&1 || true
+
+if [ -f "$runtime_env" ]; then
+  token=$(/usr/bin/node - "$runtime_env" <<'NODE'
+const fs = require('fs');
+const file = process.argv[2];
+try {
+  const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const token = data && data.authMethod === 'long_lived_access_token'
+    ? data.CLAUDE_CODE_OAUTH_TOKEN
+    : null;
+  if (typeof token === 'string' && token.startsWith('sk-ant-')) process.stdout.write(token);
+} catch {}
+NODE
+)
+  if [ -n "${token:-}" ]; then
+    export CLAUDE_CODE_OAUTH_TOKEN="$token"
+  fi
+fi
+
+official=/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    --dangerously-skip-permissions|--allow-dangerously-skip-permissions)
+      ;;
+    *)
+      args+=("$arg")
+      ;;
+  esac
+done
+
+exec "$official" "${args[@]}"

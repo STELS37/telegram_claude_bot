@@ -38,6 +38,8 @@ Expected Claude entrypoint:
 
 If `/usr/bin/claude` is an OmniRoute/Claude Code wrapper, the bot automatically uses that rotation because it only calls the configured Claude CLI.
 
+For the Telegram bots and Hermes direct CLI, use the raw Claude Code model name (`claude-opus-4-7[1m]`). The `cc/...` prefix is only for OmniRoute HTTP requests, not for the official Claude Code binary.
+
 ## Parallel Bot
 
 For a second Telegram bot with an independent Claude session and user state, run the same `bot.js` with `config-linux-parallel.json` and a separate env file:
@@ -60,6 +62,8 @@ Installed production paths:
 ```text
 /usr/local/sbin/claude-oauth-health-report.js
 /usr/local/sbin/claude-oauth-steward.sh
+/usr/local/sbin/claude-long-lived-limit-cache.js
+/usr/local/bin/claude-direct
 /usr/local/sbin/omniroute-claude-quota-rotate.js
 /usr/local/sbin/sync-omniroute-claude-code-oauth.js
 /etc/systemd/system/claude-code-oauth-sync.service
@@ -79,6 +83,8 @@ sudo /usr/local/sbin/import-claude-long-lived-token.js \
 ```
 
 Do not put the token in shell history. The importer stores only encrypted token material plus a short hash for deduplication.
+
+These access-only tokens can run Claude Code inference, but the `user:inference` scope does not expose exact account quota telemetry to OmniRoute. The steward therefore seeds an estimated/bootstrap limit cache for Dashboard › Limits and routing stability. Real OAuth accounts with refresh tokens still use fetched 5h/week quota data.
 
 ## Safety
 
