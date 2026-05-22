@@ -914,7 +914,9 @@ function isOmniRouteQuotaNotice(text) {
     const value = String(text || '');
     return value.includes('Сейчас нет свободного Claude Opus')
         || value.includes('Нет доступного Claude-аккаунта')
-        || value.includes('No quota-eligible OmniRoute Claude connection');
+        || value.includes('No quota-eligible OmniRoute Claude connection')
+        || value.includes("You've hit your org's monthly usage limit")
+        || value.includes('monthly usage limit');
 }
 
 function isTransientClaudeApiError(text, state = {}) {
@@ -924,6 +926,13 @@ function isTransientClaudeApiError(text, state = {}) {
         || /API Error:\s*5\d\d/i.test(value)
         || value.includes('Internal server error')
         || value.includes('server_error');
+}
+
+function isClaudeAuthRouteError(text) {
+    const value = String(text || '').toLowerCase();
+    return value.includes('invalid authentication credentials')
+        || value.includes('failed to authenticate')
+        || value.includes('not logged in');
 }
 
 function currentJobStatusText(userId) {
@@ -1306,6 +1315,7 @@ function startJobMonitor(jobId, options = {}) {
                 const errMsg = state.error || 'Claude job failed';
                 const quotaNotice = isOmniRouteQuotaNotice(errMsg);
                 const transientApiError = isTransientClaudeApiError(errMsg, state);
+                const authRouteError = isClaudeAuthRouteError(errMsg);
                 if (statusMsgId) {
                     try {
                         await bot.editMessageText(renderStatus(quotaNotice ? '⏳ Лимиты Claude' : '⚠ Ошибка'), {
@@ -1328,9 +1338,14 @@ function startJobMonitor(jobId, options = {}) {
                     }
                     saveSessions(sessions);
                 }
-                const hint = !quotaNotice && transientApiError && state.sessionId
-                    ? '\n\nℹ Похоже, зависла текущая Claude-сессия. Я сбросил её; следующий запрос пойдёт с нового контекста.'
-                    : (!quotaNotice && sid ? '\n\nℹ Сессия сохранена. Просто напиши «продолжай» — попробую с того же места.' : '');
+                let hint = '';
+                if (!quotaNotice && transientApiError && state.sessionId) {
+                    hint = '\n\nℹ Похоже, зависла текущая Claude-сессия. Я сбросил её; следующий запрос пойдёт с нового контекста.';
+                } else if (!quotaNotice && authRouteError) {
+                    hint = '\n\nℹ Это проблема авторизации выбранного Claude-маршрута. Я обновлю OAuth/переключу маршрут; повтори запрос.';
+                } else if (!quotaNotice && sid) {
+                    hint = '\n\nℹ Сессия сохранена. Просто напиши «продолжай» — попробую с того же места.';
+                }
                 const prefix = quotaNotice ? '' : '⚠ Ошибка:\n';
                 for (const chunk of splitForTelegram(prefix + errMsg + hint, config.maxMessageLength || 3800)) {
                     await bot.sendMessage(chatId, chunk).catch(() => {});

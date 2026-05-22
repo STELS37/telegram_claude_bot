@@ -19,6 +19,8 @@ const OAUTH_SYNC_PATH = '/usr/local/sbin/sync-omniroute-claude-code-oauth.js';
 const OAUTH_IMPORT_PATH = '/usr/local/sbin/import-claude-code-oauth-to-omniroute.js';
 const ROOT_CLAUDE_DIR = '/root/.claude';
 const RUNTIME_ENV_PATH = path.join(ROOT_CLAUDE_DIR, '.omniroute-runtime-env.json');
+const OMNIROUTE_PROJECT = '/a0/usr/projects/omniroute';
+const OMNIROUTE_DB_PATH = '/var/lib/omniroute/storage.sqlite';
 const FULL_ACCESS_TOOLS = [
     'Bash(*)',
     'Read(*)',
@@ -73,6 +75,160 @@ function redactSensitiveText(text) {
         .replace(/sk-ant-[A-Za-z0-9_-]+/g, '[redacted-token]')
         .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, '$1[redacted-token]')
         .replace(/((?:access|refresh)[_-]?token["']?\s*[:=]\s*["']?)[^"'\s,}]+/gi, '$1[redacted-token]');
+}
+
+function isClaudeMonthlyUsageLimit(text) {
+    const value = String(text || '').toLowerCase();
+    return value.includes('monthly usage limit')
+        || value.includes("org's monthly")
+        || value.includes('org monthly');
+}
+
+function nextMonthStartIso(now = new Date()) {
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, 0, 0, 0, 0)).toISOString();
+}
+
+function markClaudeMonthlyUsageLimit(home, errorText) {
+    if (!isClaudeMonthlyUsageLimit(errorText)) return null;
+
+    const baseHome = home || '/root';
+    const syncPath = path.basename(baseHome) === '.claude'
+        ? path.join(baseHome, '.omniroute-sync.json')
+        : path.join(baseHome, '.claude', '.omniroute-sync.json');
+    const sync = readJson(syncPath, null);
+    if (!sync || !sync.connectionId) {
+        return { ok: false, reason: 'omniroute sync metadata missing' };
+    }
+
+    try {
+        const Database = require(path.join(OMNIROUTE_PROJECT, 'node_modules/better-sqlite3'));
+        const db = new Database(OMNIROUTE_DB_PATH);
+        try {
+            const nowIso = new Date().toISOString();
+            const blockUntil = nextMonthStartIso();
+            const info = db.prepare(
+                `UPDATE provider_connections
+                    SET rate_limited_until = ?,
+                        error_code = ?,
+                        last_error = ?,
+                        last_error_at = ?,
+                        last_error_type = ?,
+                        last_error_source = ?,
+                        priority = CASE WHEN priority < 80 THEN 80 ELSE priority END,
+                        updated_at = ?
+                  WHERE provider = 'claude'
+                    AND id = ?`
+            ).run(
+                blockUntil,
+                'monthly_usage_limit',
+                'Claude Code reported org monthly usage limit',
+                nowIso,
+                'rate_limit',
+                'claude_code_cli',
+                nowIso,
+                sync.connectionId
+            );
+            return {
+                ok: info.changes > 0,
+                connectionId: sync.connectionId,
+                connectionName: sync.connectionName || null,
+                blockUntil
+            };
+        } finally {
+            db.close();
+        }
+    } catch (err) {
+        return { ok: false, connectionId: sync.connectionId, error: err.message };
+    }
+}
+
+function isClaudeAuthCredentialError(text) {
+    const value = String(text || '').toLowerCase();
+    return value.includes('invalid authentication credentials')
+        || value.includes('failed to authenticate')
+        || value.includes('not logged in');
+}
+
+function markClaudeAuthCredentialRoute(home, errorText) {
+    if (!isClaudeAuthCredentialError(errorText)) return null;
+
+    const baseHome = home || '/root';
+    const syncPath = path.basename(baseHome) === '.claude'
+        ? path.join(baseHome, '.omniroute-sync.json')
+        : path.join(baseHome, '.claude', '.omniroute-sync.json');
+    const sync = readJson(syncPath, null);
+    if (!sync || !sync.connectionId) {
+        return { ok: false, reason: 'omniroute sync metadata missing' };
+    }
+
+    try {
+        const Database = require(path.join(OMNIROUTE_PROJECT, 'node_modules/better-sqlite3'));
+        const db = new Database(OMNIROUTE_DB_PATH);
+        try {
+            const now = new Date();
+            const nowIso = now.toISOString();
+            const blockUntil = new Date(now.getTime() + 2 * 60 * 60 * 1000).toISOString();
+            const info = db.prepare(
+                `UPDATE provider_connections
+                    SET rate_limited_until = ?,
+                        error_code = ?,
+                        last_error = ?,
+                        last_error_at = ?,
+                        last_error_type = ?,
+                        last_error_source = ?,
+                        priority = CASE WHEN priority < 90 THEN 90 ELSE priority END,
+                        updated_at = ?
+                  WHERE provider = 'claude'
+                    AND id = ?`
+            ).run(
+                blockUntil,
+                'invalid_auth_credentials',
+                'Claude Code reported invalid authentication credentials',
+                nowIso,
+                'auth',
+                'claude_code_cli_auth',
+                nowIso,
+                sync.connectionId
+            );
+            return {
+                ok: info.changes > 0,
+                connectionId: sync.connectionId,
+                connectionName: sync.connectionName || null,
+                blockUntil
+            };
+        } finally {
+            db.close();
+        }
+    } catch (err) {
+        return { ok: false, connectionId: sync.connectionId, error: err.message };
+    }
+}
+
+function forceRefreshClaudeOAuthAfterAuthError(errorText) {
+    if (!isClaudeAuthCredentialError(errorText)) return null;
+    if (!fs.existsSync(OAUTH_SYNC_PATH)) return { ok: false, reason: 'oauth sync script missing' };
+
+    try {
+        return withFileLock('/tmp/claude-oauth-sync.lock', () => {
+            const sync = spawnSync(process.execPath, [OAUTH_SYNC_PATH, '--force', '--quiet'], {
+                cwd: '/root',
+                env: { ...process.env },
+                stdio: ['ignore', 'pipe', 'pipe'],
+                timeout: 60 * 1000
+            });
+            const stdout = sync.stdout ? sync.stdout.toString('utf8') : '';
+            const stderr = sync.stderr ? sync.stderr.toString('utf8') : '';
+            return {
+                ok: !sync.error && sync.status === 0,
+                status: sync.status,
+                error: sync.error ? sync.error.message : null,
+                stdoutTail: redactSensitiveText(tailText(stdout, 1000)),
+                stderrTail: redactSensitiveText(tailText(stderr, 1000))
+            };
+        });
+    } catch (err) {
+        return { ok: false, error: err.message };
+    }
 }
 
 function formatMoscowTime(isoValue) {
@@ -691,8 +847,15 @@ try {
                     lastResultEvent = event;
                     if (!terminalStateWritten) {
                         terminalStateWritten = true;
+                        const errMsg = event.is_error ? resultErrorMessage(event, stderrBuf) : '';
+                        const monthlyLimitBlock = errMsg ? markClaudeMonthlyUsageLimit(launch.home, errMsg) : null;
+                        const authRouteBlock = errMsg ? markClaudeAuthCredentialRoute(launch.home, errMsg) : null;
+                        const authRefresh = errMsg ? forceRefreshClaudeOAuthAfterAuthError(errMsg) : null;
                         mergeState(terminalStateFromResult(event, observedSessionId, stderrBuf, {
-                            resultReadyAt: new Date().toISOString()
+                            resultReadyAt: new Date().toISOString(),
+                            monthlyLimitBlock,
+                            authRouteBlock,
+                            authRefresh
                         }));
                         setTimeout(() => {
                             const latest = readJson(stateFile, {});
@@ -781,10 +944,17 @@ try {
                 error: 'Claude finished without result event'
             });
         } else if (lastResultEvent.is_error) {
+            const errMsg = resultErrorMessage(lastResultEvent, stderrBuf);
+            const monthlyLimitBlock = markClaudeMonthlyUsageLimit(launch.home, errMsg);
+            const authRouteBlock = markClaudeAuthCredentialRoute(launch.home, errMsg);
+            const authRefresh = forceRefreshClaudeOAuthAfterAuthError(errMsg);
             mergeState({
                 ...base,
+                monthlyLimitBlock,
+                authRouteBlock,
+                authRefresh,
                 status: 'error',
-                error: resultErrorMessage(lastResultEvent, stderrBuf),
+                error: errMsg,
                 api_error_status: lastResultEvent.api_error_status || null,
                 resultEvent: lastResultEvent,
                 result: lastResultEvent.result || lastResultEvent.message || '',
