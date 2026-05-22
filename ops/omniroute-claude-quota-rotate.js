@@ -378,10 +378,15 @@ function analyzeConnection(conn, snapshots, caches, nowMs) {
   };
 }
 
+function eligibilityTier(item) {
+  return item.authMethod === 'long_lived_access_token' ? 1 : 0;
+}
+
 function buildPriorityPlan(statuses) {
   const eligible = statuses
     .filter((item) => item.eligible)
     .sort((a, b) =>
+      eligibilityTier(a) - eligibilityTier(b) ||
       b.rotationScore - a.rotationScore ||
       b.score - a.score ||
       (a.lastUsedAgeSeconds ?? Number.MAX_SAFE_INTEGER) - (b.lastUsedAgeSeconds ?? Number.MAX_SAFE_INTEGER) ||
