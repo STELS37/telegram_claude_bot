@@ -4,6 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { spawnSync } = require('child_process');
 
 const PROJECT = '/a0/usr/projects/omniroute';
 const DB_PATH = '/var/lib/omniroute/storage.sqlite';
@@ -11,6 +12,7 @@ const CREDENTIALS_PATH = '/root/.claude/.credentials.json';
 const SYNC_META_PATH = '/root/.claude/.omniroute-sync.json';
 const RUNTIME_ENV_PATH = '/root/.claude/.omniroute-runtime-env.json';
 const ROTATOR_PATH = '/usr/local/sbin/omniroute-claude-quota-rotate.js';
+const LIMIT_CACHE_PATH = '/usr/local/sbin/claude-long-lived-limit-cache.js';
 const REFRESH_BEFORE_MS = 2 * 60 * 60 * 1000;
 const LONG_LIVED_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
 const FORCE = process.argv.includes('--force');
@@ -201,6 +203,22 @@ async function refresh(refreshToken) {
   return JSON.parse(text);
 }
 
+function seedLongLivedLimitCache() {
+  if (!fs.existsSync(LIMIT_CACHE_PATH)) return;
+  const result = spawnSync(process.execPath, [LIMIT_CACHE_PATH, '--quiet'], {
+    cwd: PROJECT,
+    env: { ...process.env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 30 * 1000,
+  });
+  if (!QUIET && (result.error || result.status !== 0)) {
+    const errorText = result.error
+      ? result.error.message
+      : (result.stderr && result.stderr.toString('utf8').trim()) || 'unknown error';
+    console.error(JSON.stringify({ warning: 'long-lived quota cache seed failed', error: errorText }));
+  }
+}
+
 function selectConnection(db) {
   const fields = 'id, name, access_token, refresh_token, expires_at, scope, provider_specific_data';
   if (fs.existsSync(ROTATOR_PATH)) {
@@ -230,6 +248,7 @@ function selectConnection(db) {
 }
 
 (async () => {
+  seedLongLivedLimitCache();
   const db = loadDb();
   const { row, selection } = selectConnection(db);
   let accessToken = decrypt(row.access_token);

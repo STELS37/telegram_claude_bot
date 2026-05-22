@@ -401,8 +401,7 @@ function buildOmniRouteQuotaStatusMessage() {
             const bt = bb ? new Date(bb).getTime() : Number.MAX_SAFE_INTEGER;
             if (at !== bt) return at - bt;
             return (b.score || 0) - (a.score || 0);
-        })
-        .slice(0, 5);
+        });
 
     const next = accounts[0] || null;
     const nextLines = next
@@ -420,7 +419,7 @@ function buildOmniRouteQuotaStatusMessage() {
         '',
         'Правило резерва: 5ч >= ' + (thresholds.sessionMinRemaining ?? 50) + '%, 7д >= ' + (thresholds.weeklyMinRemaining ?? 20) + '%.',
         '',
-        'Все аккаунты:',
+        'Все аккаунты (' + accounts.length + '):',
         ...accounts.map(buildAccountLine)
     ].join('\n');
 }

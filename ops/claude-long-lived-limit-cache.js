@@ -12,6 +12,7 @@ const WEEKLY_WINDOW = 'weekly (7d)';
 const SONNET_WINDOW = 'weekly sonnet (7d)';
 const DESIGNER_WINDOW = 'weekly designer (7d)';
 const SOURCE = 'long-lived-estimated';
+const CACHE_SOURCE = 'manual';
 const DEFAULT_REMAINING = 100;
 
 const quiet = process.argv.includes('--quiet');
@@ -59,6 +60,13 @@ function isFuture(value, nowMs) {
   return ms !== null && ms > nowMs;
 }
 
+function isOwnQuotaThreshold(row) {
+  if (!row) return false;
+  if (row.error_code === 'quota_threshold') return true;
+  if (row.last_error_source === 'quota_rotate') return true;
+  return /quota threshold/i.test(String(row.last_error || ''));
+}
+
 function remainingFor(meta, windowKey) {
   const byWindow = meta.bootstrapQuotaRemaining && typeof meta.bootstrapQuotaRemaining === 'object'
     ? meta.bootstrapQuotaRemaining
@@ -92,7 +100,7 @@ function buildCacheEntry(row, meta, nowMs) {
   let sessionResetAt = null;
   let weeklyResetAt = null;
 
-  if (isFuture(row.rate_limited_until, nowMs)) {
+  if (isFuture(row.rate_limited_until, nowMs) && !isOwnQuotaThreshold(row)) {
     sessionRemaining = 0;
     weeklyRemaining = 0;
     sonnetRemaining = 0;
@@ -112,7 +120,7 @@ function buildCacheEntry(row, meta, nowMs) {
     plan: meta.plan || meta.planName || 'Claude Code',
     message: null,
     fetchedAt,
-    source: SOURCE,
+    source: CACHE_SOURCE,
     note: 'Access-only long-lived Claude Code token. The token scope does not expose real account quota telemetry, so this is an estimated/bootstrap cache used to keep routing and UI stable.',
   };
 }
@@ -144,6 +152,7 @@ function main() {
     SELECT id, provider, auth_type, name, is_active, rate_limited_until, expires_at, scope,
            access_token IS NOT NULL AS has_access_token,
            refresh_token IS NOT NULL AS has_refresh_token,
+           last_error, last_error_source, error_code,
            provider_specific_data
       FROM provider_connections
      WHERE provider = ? AND is_active = 1
@@ -168,6 +177,20 @@ function main() {
      WHERE connection_id = ?
        AND raw_data LIKE '%"source":"long-lived-estimated"%'
        AND created_at < ?
+  `);
+  const clearOwnQuotaBlock = db.prepare(`
+    UPDATE provider_connections
+       SET rate_limited_until = NULL,
+           error_code = NULL,
+           last_error = NULL,
+           last_error_at = NULL,
+           last_error_type = NULL,
+           last_error_source = NULL,
+           updated_at = ?
+     WHERE id = ?
+       AND (error_code = 'quota_threshold'
+            OR last_error_source = 'quota_rotate'
+            OR last_error LIKE '%quota threshold%')
   `);
 
   const tx = db.transaction((items) => {
@@ -198,6 +221,7 @@ function main() {
         },
       };
       updateMeta.run(JSON.stringify(nextMeta), nowIso, row.id);
+      if (isOwnQuotaThreshold(row)) clearOwnQuotaBlock.run(nowIso, row.id);
     }
   });
 
