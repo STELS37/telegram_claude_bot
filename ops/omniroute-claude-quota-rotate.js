@@ -19,6 +19,9 @@ const OLD_USE_BONUS_MS = numberEnv('CLAUDE_ROTATE_OLD_USE_BONUS_MS', 90 * 60 * 1
 const VERY_OLD_USE_BONUS_MS = numberEnv('CLAUDE_ROTATE_VERY_OLD_USE_BONUS_MS', 4 * 60 * 60 * 1000);
 const CONSECUTIVE_WINDOW_MS = numberEnv('CLAUDE_ROTATE_CONSECUTIVE_WINDOW_MS', 30 * 60 * 1000);
 const TOKEN_EXPIRY_BUFFER_MS = numberEnv('CLAUDE_ROTATE_TOKEN_EXPIRY_BUFFER_MS', 5 * 60 * 1000);
+const LONG_LIVED_RESERVE_SESSION_FLOOR = numberEnv('CLAUDE_ROTATE_LONG_LIVED_RESERVE_SESSION_FLOOR', 65);
+const LONG_LIVED_RESERVE_WEEKLY_FLOOR = numberEnv('CLAUDE_ROTATE_LONG_LIVED_RESERVE_WEEKLY_FLOOR', 30);
+const LONG_LIVED_RESERVE_MAX_CONSECUTIVE_MEASURED = numberEnv('CLAUDE_ROTATE_LONG_LIVED_RESERVE_MAX_CONSECUTIVE_MEASURED', 3);
 
 function numberEnv(name, fallback) {
   const value = Number(process.env[name]);
@@ -378,15 +381,34 @@ function analyzeConnection(conn, snapshots, caches, nowMs) {
   };
 }
 
-function eligibilityTier(item) {
-  return item.authMethod === 'long_lived_access_token' ? 1 : 0;
+function isStrongMeasuredEligible(item) {
+  if (!item.eligible || item.authMethod === 'long_lived_access_token') return false;
+  const sessionRemaining = Number(item.session && item.session.remaining);
+  const weeklyRemaining = Number(item.weekly && item.weekly.remaining);
+  const consecutiveUseCount = Number(item.consecutiveUseCount || 0);
+  return (
+    Number.isFinite(sessionRemaining) &&
+    Number.isFinite(weeklyRemaining) &&
+    sessionRemaining >= LONG_LIVED_RESERVE_SESSION_FLOOR &&
+    weeklyRemaining >= LONG_LIVED_RESERVE_WEEKLY_FLOOR &&
+    consecutiveUseCount < LONG_LIVED_RESERVE_MAX_CONSECUTIVE_MEASURED
+  );
+}
+
+function hasStrongMeasuredEligible(statuses) {
+  return statuses.some(isStrongMeasuredEligible);
+}
+
+function eligibilityTier(item, statuses) {
+  if (item.authMethod !== 'long_lived_access_token') return 0;
+  return hasStrongMeasuredEligible(statuses) ? 1 : 0;
 }
 
 function buildPriorityPlan(statuses) {
   const eligible = statuses
     .filter((item) => item.eligible)
     .sort((a, b) =>
-      eligibilityTier(a) - eligibilityTier(b) ||
+      eligibilityTier(a, statuses) - eligibilityTier(b, statuses) ||
       b.rotationScore - a.rotationScore ||
       b.score - a.score ||
       (a.lastUsedAgeSeconds ?? Number.MAX_SAFE_INTEGER) - (b.lastUsedAgeSeconds ?? Number.MAX_SAFE_INTEGER) ||
@@ -514,6 +536,9 @@ function rotateClaudeConnections(db, options = {}) {
       weeklyMinRemaining: THRESHOLDS[WEEKLY_WINDOW],
       sessionMaxUsed: 100 - THRESHOLDS[SESSION_WINDOW],
       weeklyMaxUsed: 100 - THRESHOLDS[WEEKLY_WINDOW],
+      longLivedReserveSessionFloor: LONG_LIVED_RESERVE_SESSION_FLOOR,
+      longLivedReserveWeeklyFloor: LONG_LIVED_RESERVE_WEEKLY_FLOOR,
+      longLivedReserveMaxConsecutiveMeasured: LONG_LIVED_RESERVE_MAX_CONSECUTIVE_MEASURED,
     },
     selected: selected
       ? {
