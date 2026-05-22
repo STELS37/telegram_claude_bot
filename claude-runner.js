@@ -16,6 +16,7 @@ const eventsFile = path.join(jobDir, 'events.jsonl');
 const stderrFile = path.join(jobDir, 'stderr.log');
 const OFFICIAL_CLAUDE_PATH = '/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe';
 const OAUTH_SYNC_PATH = '/usr/local/sbin/sync-omniroute-claude-code-oauth.js';
+const OAUTH_IMPORT_PATH = '/usr/local/sbin/import-claude-code-oauth-to-omniroute.js';
 const ROOT_CLAUDE_DIR = '/root/.claude';
 const FULL_ACCESS_TOOLS = [
     'Bash(*)',
@@ -337,6 +338,26 @@ function linkClaudeProjects(destClaudeDir, warnings) {
     }
 }
 
+function importClaudeOAuthBack(home) {
+    if (!home || !fs.existsSync(OAUTH_IMPORT_PATH)) return null;
+    const sync = spawnSync(process.execPath, [OAUTH_IMPORT_PATH, '--home', home, '--quiet'], {
+        cwd: config.workdir || '/root',
+        env: { ...process.env },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 60 * 1000
+    });
+    const output = redactSensitiveText([
+        sync.stdout ? sync.stdout.toString('utf8') : '',
+        sync.stderr ? sync.stderr.toString('utf8') : ''
+    ].join('\n')).trim();
+    return {
+        status: sync.status,
+        ok: !sync.error && sync.status === 0,
+        error: sync.error ? sync.error.message : null,
+        output: output.slice(-1000)
+    };
+}
+
 function prepareClaudeLaunch(config) {
     const childEnv = { ...process.env };
     delete childEnv.ANTHROPIC_API_KEY;
@@ -382,6 +403,7 @@ function prepareClaudeLaunch(config) {
             );
             if (!copiedCreds) warnings.push('root Claude credentials missing');
 
+            copyIfExists(path.join(ROOT_CLAUDE_DIR, '.omniroute-sync.json'), path.join(isolatedClaudeDir, '.omniroute-sync.json'), 0o600);
             copyIfExists(path.join(ROOT_CLAUDE_DIR, 'settings.json'), path.join(isolatedClaudeDir, 'settings.json'), 0o600);
             copyIfExists(path.join(ROOT_CLAUDE_DIR, 'policy-limits.json'), path.join(isolatedClaudeDir, 'policy-limits.json'), 0o600);
             linkClaudeProjects(isolatedClaudeDir, warnings);
@@ -699,6 +721,7 @@ try {
     });
 
     proc.on('close', (code, signal) => {
+        const oauthImportResult = launch.launchMode === 'isolated-home' ? importClaudeOAuthBack(launch.home) : null;
         const current = readJson(stateFile, {});
         const stopRequested = !!current.stopRequestedAt && !!current.stopRequestedBy;
         const externalSignal = !stopRequested && current.externalSignal;
@@ -708,7 +731,8 @@ try {
             exitSignal: signal,
             observedSessionId,
             stderrTail: tailText(stderrBuf),
-            stdoutTail: tailText(stdoutBuf)
+            stdoutTail: tailText(stdoutBuf),
+            oauthImport: oauthImportResult
         };
         if (terminalStateWritten) {
             mergeState({
