@@ -1338,6 +1338,37 @@ function startJobMonitor(jobId, options = {}) {
                     }
                     saveSessions(sessions);
                 }
+                if (!quotaNotice && authRouteError && state.authRouteBlock && state.authRouteBlock.ok && state.authRefresh && state.authRefresh.ok && !state.authRetryOf) {
+                    const retryNote = '🔁 Авторизация выбранного Claude-маршрута сломалась. Переключаю маршрут и повторяю запрос автоматически…';
+                    mergeJobState(jobId, {
+                        telegramStatus: 'auth_retry_started',
+                        deliveredAt: new Date().toISOString(),
+                        authRetryStartedAt: new Date().toISOString()
+                    });
+                    if (statusMsgId) {
+                        try {
+                            await bot.editMessageText(renderStatus(retryNote), {
+                                chat_id: chatId, message_id: statusMsgId,
+                                disable_web_page_preview: true
+                            });
+                        } catch {}
+                    } else {
+                        await bot.sendMessage(chatId, retryNote).catch(() => {});
+                    }
+                    clearCurrentJob(userId, jobId);
+                    const retryJobId = startClaudeJob(userId, chatId, job.prompt || '', settings, job.sessionId || null);
+                    mergeJobState(retryJobId, {
+                        authRetryOf: jobId,
+                        authRetryReason: 'invalid_auth_credentials',
+                        authRetrySourceConnectionId: state.authRouteBlock.connectionId || null,
+                        authRetrySourceConnectionName: state.authRouteBlock.connectionName || null
+                    });
+                    mergeJobState(jobId, { authRetryJobId: retryJobId });
+                    log(`auth route retry: old=${jobId}, new=${retryJobId}, bad=${state.authRouteBlock.connectionId || 'unknown'}`);
+                    startJobMonitor(retryJobId, { statusMsgId, replayFromStart: true });
+                    return;
+                }
+
                 let hint = '';
                 if (!quotaNotice && transientApiError && state.sessionId) {
                     hint = '\n\nℹ Похоже, зависла текущая Claude-сессия. Я сбросил её; следующий запрос пойдёт с нового контекста.';
