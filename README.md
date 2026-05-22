@@ -65,6 +65,21 @@ Installed production paths:
 /etc/systemd/system/claude-code-oauth-sync.service
 ```
 
+
+### Long-Lived Claude Tokens
+
+Long-lived Claude Code tokens (`CLAUDE_CODE_OAUTH_TOKEN` / `sk-ant-oat...`) are imported as access-only Claude connections. They intentionally have no refresh token and are passed to Claude Code through a runtime env file, not through `.credentials.json`. Use:
+
+```bash
+sudo /usr/local/sbin/import-claude-long-lived-token.js \
+  --token-file /root/.secrets/claude-token.txt \
+  --name 'Claude Shop Max 20x long-lived YYYY-MM-DD' \
+  --expires-at YYYY-MM-DD \
+  --scope 'user:inference'
+```
+
+Do not put the token in shell history. The importer stores only encrypted token material plus a short hash for deduplication.
+
 ## Safety
 
 Do not commit:

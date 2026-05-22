@@ -9,8 +9,10 @@ const PROJECT = '/a0/usr/projects/omniroute';
 const DB_PATH = '/var/lib/omniroute/storage.sqlite';
 const CREDENTIALS_PATH = '/root/.claude/.credentials.json';
 const SYNC_META_PATH = '/root/.claude/.omniroute-sync.json';
+const RUNTIME_ENV_PATH = '/root/.claude/.omniroute-runtime-env.json';
 const ROTATOR_PATH = '/usr/local/sbin/omniroute-claude-quota-rotate.js';
 const REFRESH_BEFORE_MS = 2 * 60 * 60 * 1000;
+const LONG_LIVED_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
 const FORCE = process.argv.includes('--force');
 const QUIET = process.argv.includes('--quiet');
 const MARK_USE = process.argv.includes('--mark-use') || process.env.CLAUDE_ROTATE_MARK_USE === '1';
@@ -22,7 +24,7 @@ function log(obj) {
 function parseEnv(p) {
   const out = {};
   for (const line of fs.readFileSync(p, 'utf8').split(/\r?\n/)) {
-    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+    const m = line.match(/^s*([A-Za-z_][A-Za-z0-9_]*)s*=s*(.*)s*$/);
     if (!m) continue;
     let v = m[2].trim();
     if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
@@ -83,12 +85,23 @@ function readClaudeCredentials() {
   }
 }
 
-function writeSyncMetadata(row, accessToken, refreshToken, expiresAtMs) {
+function parseProviderData(row) {
+  try { return row.provider_specific_data ? JSON.parse(row.provider_specific_data) : {}; }
+  catch { return {}; }
+}
+
+function isLongLivedAccessOnly(row, accessToken, refreshToken) {
+  const data = parseProviderData(row);
+  return data.authMethod === 'long_lived_access_token' || data.noRefresh === true || (!!accessToken && !refreshToken && String(accessToken).startsWith('sk-ant-oat'));
+}
+
+function writeSyncMetadata(row, accessToken, refreshToken, expiresAtMs, authMethod) {
   fs.mkdirSync(path.dirname(SYNC_META_PATH), { recursive: true, mode: 0o700 });
   const out = {
     provider: 'claude',
     connectionId: row.id,
     connectionName: row.name || null,
+    authMethod,
     syncedAt: new Date().toISOString(),
     expiresAt: new Date(expiresAtMs).toISOString(),
     accessHash: hashToken(accessToken),
@@ -96,6 +109,26 @@ function writeSyncMetadata(row, accessToken, refreshToken, expiresAtMs) {
   };
   fs.writeFileSync(SYNC_META_PATH, JSON.stringify(out, null, 2) + '\n', { mode: 0o600 });
   fs.chmodSync(SYNC_META_PATH, 0o600);
+}
+
+function writeRuntimeEnv(row, accessToken, expiresAtMs) {
+  fs.mkdirSync(path.dirname(RUNTIME_ENV_PATH), { recursive: true, mode: 0o700 });
+  const out = {
+    provider: 'claude',
+    connectionId: row.id,
+    connectionName: row.name || null,
+    authMethod: 'long_lived_access_token',
+    writtenAt: new Date().toISOString(),
+    expiresAt: new Date(expiresAtMs).toISOString(),
+    accessHash: hashToken(accessToken),
+    CLAUDE_CODE_OAUTH_TOKEN: accessToken,
+  };
+  fs.writeFileSync(RUNTIME_ENV_PATH, JSON.stringify(out, null, 2) + '\n', { mode: 0o600 });
+  fs.chmodSync(RUNTIME_ENV_PATH, 0o600);
+}
+
+function clearRuntimeEnv() {
+  try { fs.rmSync(RUNTIME_ENV_PATH, { force: true }); } catch {}
 }
 
 function writeClaudeCredentials(accessToken, refreshToken, expiresAtMs, scopes) {
@@ -126,6 +159,7 @@ function writeClaudeCredentials(accessToken, refreshToken, expiresAtMs, scopes) 
 }
 
 async function refresh(refreshToken) {
+  if (!refreshToken) throw new Error('refresh token missing');
   const params = new URLSearchParams({
     grant_type: 'refresh_token',
     refresh_token: refreshToken,
@@ -152,20 +186,14 @@ async function refresh(refreshToken) {
 }
 
 function selectConnection(db) {
-  const fields = 'id, name, access_token, refresh_token, expires_at, scope';
+  const fields = 'id, name, access_token, refresh_token, expires_at, scope, provider_specific_data';
   if (fs.existsSync(ROTATOR_PATH)) {
-    const { rotateClaudeConnections, recordClaudeConnectionUse } = require(ROTATOR_PATH);
+    const { rotateClaudeConnections } = require(ROTATOR_PATH);
     const selection = rotateClaudeConnections(db, { apply: true });
     if (!selection.selected) {
-      throw new Error(
-        `No quota-eligible OmniRoute Claude connection found; thresholds=${JSON.stringify(
-          selection.thresholds
-        )}`
-      );
+      throw new Error(`No quota-eligible OmniRoute Claude connection found; thresholds=${JSON.stringify(selection.thresholds)}`);
     }
-    const row = db
-      .prepare(`SELECT ${fields} FROM provider_connections WHERE id = ?`)
-      .get(selection.selected.id);
+    const row = db.prepare(`SELECT ${fields} FROM provider_connections WHERE id = ?`).get(selection.selected.id);
     if (!row) throw new Error(`Selected Claude connection disappeared: ${selection.selected.id}`);
     return { row, selection };
   }
@@ -192,45 +220,61 @@ function selectConnection(db) {
   let refreshToken = decrypt(row.refresh_token);
   let expiresAtMs = row.expires_at ? new Date(row.expires_at).getTime() : 0;
   let scopeText = row.scope || '';
-  let scopes = scopeText ? String(scopeText).split(/[\s,]+/).filter(Boolean) : [];
-  const remainingMs = Number.isFinite(expiresAtMs) ? expiresAtMs - Date.now() : -1;
+  let scopes = scopeText ? String(scopeText).split(/[s,]+/).filter(Boolean) : [];
+  let remainingMs = Number.isFinite(expiresAtMs) ? expiresAtMs - Date.now() : -1;
   let refreshed = false;
+  let authMethod = isLongLivedAccessOnly(row, accessToken, refreshToken) ? 'long_lived_access_token' : 'oauth_refresh';
 
-  if (FORCE || remainingMs < REFRESH_BEFORE_MS || !accessToken || !refreshToken) {
-    const tokens = await refresh(refreshToken);
-    accessToken = tokens.access_token;
-    refreshToken = tokens.refresh_token || refreshToken;
-    const expiresIn = Number(tokens.expires_in || 28800);
-    expiresAtMs = Date.now() + expiresIn * 1000;
-    scopeText = tokens.scope || scopeText || scopes.join(' ');
-    scopes = scopeText ? String(scopeText).split(/[\s,]+/).filter(Boolean) : scopes;
-    db.prepare(
-      `UPDATE provider_connections
-          SET access_token = ?,
-              refresh_token = ?,
-              expires_at = ?,
-              expires_in = ?,
-              scope = ?,
-              test_status = 'active',
-              error_code = NULL,
-              last_error = NULL,
-              last_error_at = NULL,
-              updated_at = ?
-        WHERE id = ?`
-    ).run(
-      encrypt(accessToken),
-      encrypt(refreshToken),
-      new Date(expiresAtMs).toISOString(),
-      expiresIn,
-      scopeText,
-      new Date().toISOString(),
-      row.id
-    );
-    refreshed = true;
+  if (!accessToken) throw new Error('selected Claude connection has no access token');
+
+  if (authMethod === 'long_lived_access_token') {
+    if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now() + LONG_LIVED_EXPIRY_BUFFER_MS) {
+      throw new Error('selected long-lived Claude token is expired or has no valid expires_at');
+    }
+    clearRuntimeEnv();
+    writeRuntimeEnv(row, accessToken, expiresAtMs);
+    writeSyncMetadata(row, accessToken, null, expiresAtMs, authMethod);
+  } else {
+    clearRuntimeEnv();
+    if (FORCE || remainingMs < REFRESH_BEFORE_MS || !accessToken || !refreshToken) {
+      const tokens = await refresh(refreshToken);
+      accessToken = tokens.access_token;
+      refreshToken = tokens.refresh_token || refreshToken;
+      const expiresIn = Number(tokens.expires_in || 28800);
+      expiresAtMs = Date.now() + expiresIn * 1000;
+      remainingMs = expiresAtMs - Date.now();
+      scopeText = tokens.scope || scopeText || scopes.join(' ');
+      scopes = scopeText ? String(scopeText).split(/[s,]+/).filter(Boolean) : scopes;
+      db.prepare(
+        `UPDATE provider_connections
+            SET access_token = ?,
+                refresh_token = ?,
+                expires_at = ?,
+                token_expires_at = ?,
+                expires_in = ?,
+                scope = ?,
+                test_status = 'active',
+                error_code = NULL,
+                last_error = NULL,
+                last_error_at = NULL,
+                updated_at = ?
+          WHERE id = ?`
+      ).run(
+        encrypt(accessToken),
+        encrypt(refreshToken),
+        new Date(expiresAtMs).toISOString(),
+        new Date(expiresAtMs).toISOString(),
+        expiresIn,
+        scopeText,
+        new Date().toISOString(),
+        row.id
+      );
+      refreshed = true;
+    }
+    writeClaudeCredentials(accessToken, refreshToken, expiresAtMs, scopes);
+    writeSyncMetadata(row, accessToken, refreshToken, expiresAtMs, authMethod);
   }
 
-  writeClaudeCredentials(accessToken, refreshToken, expiresAtMs, scopes);
-  writeSyncMetadata(row, accessToken, refreshToken, expiresAtMs);
   let usage = null;
   if (MARK_USE && selection?.selected?.id) {
     const { recordClaudeConnectionUse } = require(ROTATOR_PATH);
@@ -240,6 +284,7 @@ function selectConnection(db) {
     ok: true,
     connectionId: row.id,
     connectionName: row.name || null,
+    authMethod,
     selectedScore: selection?.selected?.score ?? null,
     selectedRotationScore: selection?.selected?.rotationScore ?? null,
     markUse: MARK_USE,
@@ -252,11 +297,6 @@ function selectConnection(db) {
     refresh: classify(refreshToken),
   });
 })().catch((err) => {
-  console.error(
-    JSON.stringify({
-      ok: false,
-      error: String((err && err.message) || err).replace(/sk-ant-[A-Za-z0-9_-]+/g, '[redacted-token]'),
-    })
-  );
+  console.error(JSON.stringify({ ok: false, error: String((err && err.message) || err).replace(/sk-ant-[A-Za-z0-9_-]+/g, '[redacted-token]') }));
   process.exit(1);
 });

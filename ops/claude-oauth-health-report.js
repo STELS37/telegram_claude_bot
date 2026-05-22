@@ -48,6 +48,8 @@ try {
       hasRefreshToken: !!row.refresh_token,
       hasAccessToken: !!row.access_token,
       healthCheckInterval: row.health_check_interval,
+      authMethod: meta.authMethod || null,
+      noRefresh: meta.noRefresh === true,
     };
   });
   const summary = {
@@ -56,9 +58,10 @@ try {
     total: accounts.length,
     active: accounts.filter(a => a.active).length,
     invalidGrant: accounts.filter(a => a.errorCode === 'invalid_grant').length,
-    missingRefreshToken: accounts.filter(a => a.active && !a.hasRefreshToken).length,
+    missingRefreshToken: accounts.filter(a => a.active && !a.hasRefreshToken && a.authMethod !== 'long_lived_access_token' && !a.noRefresh).length,
     expiringSoon: accounts.filter(a => a.expiringSoon).length,
     unsafeHealthChecks: accounts.filter(a => a.healthCheckInterval !== 0 && a.healthCheckInterval !== null).length,
+    longLivedAccessOnly: accounts.filter(a => a.authMethod === 'long_lived_access_token' || a.noRefresh).length,
     healthCheckTriggers: triggers,
     accounts,
   };

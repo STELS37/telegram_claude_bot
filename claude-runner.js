@@ -18,6 +18,7 @@ const OFFICIAL_CLAUDE_PATH = '/usr/lib/node_modules/@anthropic-ai/claude-code/bi
 const OAUTH_SYNC_PATH = '/usr/local/sbin/sync-omniroute-claude-code-oauth.js';
 const OAUTH_IMPORT_PATH = '/usr/local/sbin/import-claude-code-oauth-to-omniroute.js';
 const ROOT_CLAUDE_DIR = '/root/.claude';
+const RUNTIME_ENV_PATH = path.join(ROOT_CLAUDE_DIR, '.omniroute-runtime-env.json');
 const FULL_ACCESS_TOOLS = [
     'Bash(*)',
     'Read(*)',
@@ -338,6 +339,19 @@ function linkClaudeProjects(destClaudeDir, warnings) {
     }
 }
 
+function applyClaudeRuntimeEnv(childEnv, warnings) {
+    if (!fs.existsSync(RUNTIME_ENV_PATH)) return;
+    const runtime = readJson(RUNTIME_ENV_PATH, null);
+    if (!runtime || runtime.authMethod !== 'long_lived_access_token' || !runtime.CLAUDE_CODE_OAUTH_TOKEN) return;
+    const expiresAtMs = runtime.expiresAt ? Date.parse(runtime.expiresAt) : 0;
+    if (Number.isFinite(expiresAtMs) && expiresAtMs > Date.now() + 60 * 1000) {
+        childEnv.CLAUDE_CODE_OAUTH_TOKEN = runtime.CLAUDE_CODE_OAUTH_TOKEN;
+        warnings.push(`using OmniRoute long-lived Claude token: ${runtime.connectionName || runtime.connectionId || 'unknown'}`);
+    } else {
+        warnings.push('OmniRoute long-lived Claude token is expired; ignoring runtime env');
+    }
+}
+
 function importClaudeOAuthBack(home) {
     if (!home || !fs.existsSync(OAUTH_IMPORT_PATH)) return null;
     return withFileLock('/tmp/claude-oauth-sync.lock', () => {
@@ -367,6 +381,7 @@ function prepareClaudeLaunch(config) {
     delete childEnv.ANTHROPIC_CUSTOM_HEADERS;
     delete childEnv.CLAUDE_CODE_USE_BEDROCK;
     delete childEnv.CLAUDE_CODE_USE_VERTEX;
+    delete childEnv.CLAUDE_CODE_OAUTH_TOKEN;
     childEnv.CLAUDE_CODE_EFFORT_LEVEL = childEnv.CLAUDE_CODE_EFFORT_LEVEL || 'max';
     childEnv.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT = childEnv.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT || '1';
 
@@ -406,6 +421,7 @@ function prepareClaudeLaunch(config) {
             if (!copiedCreds) warnings.push('root Claude credentials missing');
 
             copyIfExists(path.join(ROOT_CLAUDE_DIR, '.omniroute-sync.json'), path.join(isolatedClaudeDir, '.omniroute-sync.json'), 0o600);
+            applyClaudeRuntimeEnv(childEnv, warnings);
             copyIfExists(path.join(ROOT_CLAUDE_DIR, 'settings.json'), path.join(isolatedClaudeDir, 'settings.json'), 0o600);
             copyIfExists(path.join(ROOT_CLAUDE_DIR, 'policy-limits.json'), path.join(isolatedClaudeDir, 'policy-limits.json'), 0o600);
             linkClaudeProjects(isolatedClaudeDir, warnings);

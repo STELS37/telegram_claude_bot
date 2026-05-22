@@ -18,6 +18,7 @@ const RECENT_USE_PENALTY_MS = numberEnv('CLAUDE_ROTATE_RECENT_PENALTY_MS', 25 * 
 const OLD_USE_BONUS_MS = numberEnv('CLAUDE_ROTATE_OLD_USE_BONUS_MS', 90 * 60 * 1000);
 const VERY_OLD_USE_BONUS_MS = numberEnv('CLAUDE_ROTATE_VERY_OLD_USE_BONUS_MS', 4 * 60 * 60 * 1000);
 const CONSECUTIVE_WINDOW_MS = numberEnv('CLAUDE_ROTATE_CONSECUTIVE_WINDOW_MS', 30 * 60 * 1000);
+const TOKEN_EXPIRY_BUFFER_MS = numberEnv('CLAUDE_ROTATE_TOKEN_EXPIRY_BUFFER_MS', 5 * 60 * 1000);
 
 function numberEnv(name, fallback) {
   const value = Number(process.env[name]);
@@ -67,7 +68,10 @@ function safeJson(raw) {
 function activeClaudeConnections(db) {
   return db
     .prepare(
-      `SELECT id, name, priority, global_priority, rate_limited_until,
+      `SELECT id, name, priority, global_priority, rate_limited_until, expires_at,
+              access_token IS NOT NULL AS has_access_token,
+              refresh_token IS NOT NULL AS has_refresh_token,
+              provider_specific_data,
               last_error_source, error_code, last_used_at, consecutive_use_count, updated_at
          FROM provider_connections
         WHERE provider = ? AND is_active = 1
@@ -190,6 +194,40 @@ function candidateFromCache(entry, windowKey, nowMs) {
   };
 }
 
+function providerData(conn) {
+  return safeJson(conn.provider_specific_data) || {};
+}
+
+function isLongLivedAccessOnly(conn) {
+  const data = providerData(conn);
+  return data.authMethod === 'long_lived_access_token' || data.noRefresh === true;
+}
+
+function bootstrapRemaining(conn, windowKey, nowMs) {
+  const data = providerData(conn);
+  const untilMs = parseDateMs(data.bootstrapQuotaUntil);
+  if (untilMs !== null && untilMs <= nowMs) return null;
+  const byWindow = data.bootstrapQuotaRemaining && typeof data.bootstrapQuotaRemaining === 'object' ? data.bootstrapQuotaRemaining : null;
+  if (byWindow && byWindow[windowKey] != null) return clampPercent(byWindow[windowKey]);
+  if (data.bootstrapQuotaRemainingPercentage != null) return clampPercent(data.bootstrapQuotaRemainingPercentage);
+  return null;
+}
+
+function applyBootstrapStatus(conn, status, windowKey, nowMs) {
+  if (!status || status.remaining !== null) return status;
+  const remaining = bootstrapRemaining(conn, windowKey, nowMs);
+  if (remaining === null) return status;
+  const thresholdRemaining = THRESHOLDS[windowKey];
+  return {
+    ...status,
+    remaining: roundPercent(remaining),
+    used: roundPercent(100 - remaining),
+    source: 'bootstrap',
+    snapshotAt: null,
+    thresholdReached: thresholdRemaining !== null && remaining < thresholdRemaining,
+  };
+}
+
 function pickWindowStatus(snapshotRow, cacheEntry, windowKey, nowMs) {
   const candidates = [
     candidateFromSnapshot(snapshotRow, nowMs),
@@ -275,8 +313,8 @@ function buildRotationScore(conn, session, weekly, headroomScore, ownQuotaMarker
 function analyzeConnection(conn, snapshots, caches, nowMs) {
   const connectionSnapshots = snapshots.get(conn.id) || new Map();
   const cacheEntry = caches.get(conn.id) || null;
-  const session = pickWindowStatus(connectionSnapshots.get(SESSION_WINDOW), cacheEntry, SESSION_WINDOW, nowMs);
-  const weekly = pickWindowStatus(connectionSnapshots.get(WEEKLY_WINDOW), cacheEntry, WEEKLY_WINDOW, nowMs);
+  const session = applyBootstrapStatus(conn, pickWindowStatus(connectionSnapshots.get(SESSION_WINDOW), cacheEntry, SESSION_WINDOW, nowMs), SESSION_WINDOW, nowMs);
+  const weekly = applyBootstrapStatus(conn, pickWindowStatus(connectionSnapshots.get(WEEKLY_WINDOW), cacheEntry, WEEKLY_WINDOW, nowMs), WEEKLY_WINDOW, nowMs);
 
   const ownQuotaMarker = conn.last_error_source === QUOTA_ERROR_SOURCE || conn.error_code === QUOTA_ERROR_CODE;
   const rateLimitedMs = parseDateMs(conn.rate_limited_until);
@@ -295,6 +333,16 @@ function analyzeConnection(conn, snapshots, caches, nowMs) {
   }
   if (externallyRateLimited) {
     reasons.push(`external rate limit until ${conn.rate_limited_until}`);
+  }
+  const tokenExpiresMs = parseDateMs(conn.expires_at);
+  if (!conn.has_access_token) {
+    reasons.push('missing access token');
+  }
+  if (!conn.has_refresh_token && !isLongLivedAccessOnly(conn)) {
+    reasons.push('missing refresh token');
+  }
+  if (tokenExpiresMs !== null && tokenExpiresMs <= nowMs + TOKEN_EXPIRY_BUFFER_MS) {
+    reasons.push(`token expires at ${conn.expires_at}`);
   }
 
   const quotaBlocked = reasons.some((reason) => reason.includes('remaining'));
@@ -322,6 +370,8 @@ function analyzeConnection(conn, snapshots, caches, nowMs) {
     externallyRateLimited,
     blockUntil: blockUntilMs === null ? null : iso(blockUntilMs),
     ownQuotaMarker,
+    authMethod: isLongLivedAccessOnly(conn) ? 'long_lived_access_token' : 'oauth_refresh',
+    expiresAt: conn.expires_at || null,
     reasons,
     session,
     weekly,
