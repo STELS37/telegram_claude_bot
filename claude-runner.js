@@ -463,6 +463,14 @@ function buildAccountLine(account, index) {
     ].filter(Boolean).join('\n');
 }
 
+function excludedAccountLine(account, index) {
+    const name = shortAccountName(account);
+    const reason = account && account.reason ? String(account.reason) : 'неактивен в OmniRoute';
+    const error = account && account.errorCode ? ' [' + account.errorCode + ']' : '';
+    const when = account && account.lastErrorAt ? ' Последняя ошибка: ' + formatMoscowTime(account.lastErrorAt) + '.' : '';
+    return String(index + 1) + '. ' + name + ' — не участвует: ' + reason + error + '.' + when;
+}
+
 function buildOmniRouteQuotaStatusMessage() {
     const rotatorPath = '/usr/local/sbin/omniroute-claude-quota-rotate.js';
     if (!fs.existsSync(rotatorPath)) return '';
@@ -499,6 +507,9 @@ function buildOmniRouteQuotaStatusMessage() {
             if (Math.abs(at - bt) > 5 * 60 * 1000) return at - bt;
             return (b.score || 0) - (a.score || 0);
         });
+    const excludedAccounts = Array.isArray(parsed.excludedAccounts)
+        ? parsed.excludedAccounts.slice().sort((a, b) => (a.priority || 0) - (b.priority || 0))
+        : [];
 
     const next = accounts[0] || null;
     const nextAvailability = next ? availabilityFromBlockingWindows(next) : null;
@@ -518,9 +529,12 @@ function buildOmniRouteQuotaStatusMessage() {
         '',
         'Правило резерва: 5ч >= ' + (thresholds.sessionMinRemaining ?? 50) + '%, 7д >= ' + (thresholds.weeklyMinRemaining ?? 20) + '%. Лимит считается реальным только после свежей проверки provider-limits.',
         '',
-        'Все аккаунты (' + accounts.length + '):',
-        ...accounts.map(buildAccountLine)
-    ].join('\n');
+        'Участвуют в real-limit ротации (' + accounts.length + '):',
+        ...accounts.map(buildAccountLine),
+        excludedAccounts.length ? '' : null,
+        excludedAccounts.length ? 'Не участвуют (' + excludedAccounts.length + '):' : null,
+        ...excludedAccounts.map(excludedAccountLine)
+    ].filter(line => line !== null).join('\n');
 }
 
 function summarizeOauthSyncFailure(sync) {

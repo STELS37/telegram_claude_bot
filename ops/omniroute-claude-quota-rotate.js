@@ -108,6 +108,22 @@ function activeClaudeConnections(db) {
     .all(PROVIDER);
 }
 
+function inactiveClaudeConnections(db) {
+  return db
+    .prepare(
+      `SELECT id, name, priority, global_priority, rate_limited_until, expires_at,
+              access_token IS NOT NULL AS has_access_token,
+              refresh_token IS NOT NULL AS has_refresh_token,
+              provider_specific_data,
+              test_status, error_code, last_error, last_error_at, last_error_type,
+              last_error_source, updated_at
+         FROM provider_connections
+        WHERE provider = ? AND is_active != 1
+        ORDER BY priority ASC, updated_at DESC`
+    )
+    .all(PROVIDER);
+}
+
 function latestQuotaSnapshots(db) {
   const rows = db
     .prepare(
@@ -245,6 +261,53 @@ function candidateFromCache(entry, windowKey, nowMs) {
 
 function providerData(conn) {
   return safeJson(conn.provider_specific_data) || {};
+}
+
+function inactiveClaudeReason(conn) {
+  const code = String(conn.error_code || '').toLowerCase();
+  const type = String(conn.last_error_type || '').toLowerCase();
+  const source = String(conn.last_error_source || '').toLowerCase();
+  const data = providerData(conn);
+  const authMethod = data.authMethod || null;
+  const accessOnly = authMethod === 'long_lived_access_token' || data.noRefresh === true;
+  const hasRefresh = Boolean(conn.has_refresh_token);
+
+  if (code === 'invalid_grant' || type === 'invalid_grant') {
+    return 'провайдер отклонил refresh token (invalid_grant); нужен свежий full OAuth импорт';
+  }
+  if (code === 'invalid_auth_credentials') {
+    if (accessOnly || !hasRefresh) {
+      return 'Claude Code отклонил access-only credentials (401); нет refresh token и реальных лимитов';
+    }
+    return 'Claude Code отклонил credentials (401); нужен свежий OAuth импорт';
+  }
+  if (accessOnly) {
+    return 'long-lived access-only token; нет refresh token и реальных лимитов';
+  }
+  if (!hasRefresh) return 'нет refresh token';
+  if (source) return 'отключён в OmniRoute после ошибки ' + source;
+  return 'отключён в OmniRoute';
+}
+
+function inactiveClaudeAccount(conn) {
+  const data = providerData(conn);
+  return {
+    id: conn.id,
+    name: conn.name || conn.id,
+    priority: conn.priority,
+    globalPriority: conn.global_priority,
+    isActive: false,
+    testStatus: conn.test_status || null,
+    errorCode: conn.error_code || null,
+    lastErrorAt: conn.last_error_at || null,
+    lastErrorType: conn.last_error_type || null,
+    lastErrorSource: conn.last_error_source || null,
+    expiresAt: conn.expires_at || null,
+    hasAccessToken: Boolean(conn.has_access_token),
+    hasRefreshToken: Boolean(conn.has_refresh_token),
+    authMethod: data.authMethod || null,
+    reason: inactiveClaudeReason(conn),
+  };
 }
 
 function isLongLivedAccessOnly(conn) {
@@ -645,6 +708,7 @@ function recordClaudeConnectionUse(db, connectionId, options = {}) {
 function rotateClaudeConnections(db, options = {}) {
   const nowMs = options.nowMs || Date.now();
   const connections = activeClaudeConnections(db);
+  const excludedAccounts = inactiveClaudeConnections(db).map(inactiveClaudeAccount);
   const snapshots = latestQuotaSnapshots(db);
   const caches = providerLimitsCache(db);
   const statuses = connections.map((conn) => analyzeConnection(conn, snapshots, caches, nowMs));
@@ -680,6 +744,7 @@ function rotateClaudeConnections(db, options = {}) {
         }
       : null,
     accounts: statuses,
+    excludedAccounts,
   };
 }
 
