@@ -9,6 +9,7 @@ sessions*.json
 user-settings*.json
 pending-choices*.json
 current-jobs*.json
+message-queue*.json
 incoming/
 crash-dumps/
 state-backups/

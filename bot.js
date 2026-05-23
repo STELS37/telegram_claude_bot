@@ -1524,7 +1524,15 @@ function startJobMonitor(jobId, options = {}) {
         }
     }
 
-    const typingInterval = setInterval(() => bot.sendChatAction(chatId, 'typing').catch(() => {}), 4000);
+    const typingInterval = setInterval(() => {
+        const current = getCurrentLiveJob(userId);
+        const state = readJobState(jobId);
+        if (!current || current.jobId !== jobId || !isJobLive(state)) {
+            clearInterval(typingInterval);
+            return;
+        }
+        bot.sendChatAction(chatId, 'typing').catch(() => {});
+    }, 4000);
     const pollInterval = setInterval(async () => {
         try {
             writeHeartbeat();
@@ -1542,7 +1550,14 @@ function startJobMonitor(jobId, options = {}) {
                 }
             }
             const state = readJobState(jobId);
-            if (!state) return;
+            const current = getCurrentLiveJob(userId);
+            if (!state || (current && current.jobId !== jobId)) {
+                clearInterval(pollInterval);
+                clearInterval(typingInterval);
+                activeJobMonitors.delete(jobId);
+                log(`job monitor ${jobId} stopped: ${state ? 'superseded' : 'missing state'}`);
+                return;
+            }
             if (settings.showProgress && statusMsgId && state.status === 'running') {
                 const now = Date.now();
                 if (now - lastIdleStatusAt > 15000) {
@@ -1813,7 +1828,14 @@ async function processUserMessageLegacy(userId, chatId, prompt) {
 
     // initial typing
     bot.sendChatAction(chatId, 'typing').catch(() => {});
-    const typingInterval = setInterval(() => bot.sendChatAction(chatId, 'typing').catch(() => {}), 4000);
+    const typingInterval = setInterval(() => {
+        const proc = userActiveClaude.get(userId);
+        if (!proc || proc.killed) {
+            clearInterval(typingInterval);
+            return;
+        }
+        bot.sendChatAction(chatId, 'typing').catch(() => {});
+    }, 4000);
 
     // Status message that gets edited as steps happen
     let statusMsgId = null;
