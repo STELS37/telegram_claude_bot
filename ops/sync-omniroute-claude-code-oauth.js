@@ -161,6 +161,12 @@ function clearRuntimeEnv() {
   try { fs.rmSync(RUNTIME_ENV_PATH, { force: true }); } catch {}
 }
 
+function clearSyncedClaudeAuth() {
+  clearRuntimeEnv();
+  try { fs.rmSync(CREDENTIALS_PATH, { force: true }); } catch {}
+  try { fs.rmSync(SYNC_META_PATH, { force: true }); } catch {}
+}
+
 function writeClaudeCredentials(accessToken, refreshToken, expiresAtMs, scopes) {
   fs.mkdirSync(path.dirname(CREDENTIALS_PATH), { recursive: true, mode: 0o700 });
   const existing = readClaudeCredentials();
@@ -324,7 +330,7 @@ function selectConnection(db) {
     if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now() + LONG_LIVED_EXPIRY_BUFFER_MS) {
       throw new Error('selected long-lived Claude token is expired or has no valid expires_at');
     }
-    clearRuntimeEnv();
+    clearSyncedClaudeAuth();
     writeRuntimeEnv(row, accessToken, expiresAtMs);
     writeSyncMetadata(row, accessToken, null, expiresAtMs, authMethod);
   } else {
@@ -399,7 +405,7 @@ function selectConnection(db) {
     refresh: classify(refreshToken),
   });
 })().catch((err) => {
-  clearRuntimeEnv();
+  clearSyncedClaudeAuth();
   console.error(JSON.stringify({ ok: false, error: String((err && err.message) || err).replace(/sk-ant-[A-Za-z0-9_-]+/g, '[redacted-token]') }));
   process.exit(1);
 });
