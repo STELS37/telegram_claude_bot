@@ -1213,6 +1213,7 @@ function collectStepFromEvent(event) {
 
 function collectThinkingFromEvent(event) {
     if (!event || event.type !== 'assistant' || !event.message || !Array.isArray(event.message.content)) return [];
+    if (event.error || event.message.model === '<synthetic>') return [];
     const blocks = event.message.content;
     const hasToolUse = blocks.some(b => b.type === 'tool_use');
     const out = [];
@@ -1504,7 +1505,16 @@ function startJobMonitor(jobId, options = {}) {
                 if (!quotaNotice && transientApiError && state.sessionId) {
                     hint = '\n\nℹ Похоже, зависла текущая Claude-сессия. Я сбросил её; следующий запрос пойдёт с нового контекста.';
                 } else if (!quotaNotice && authRouteError) {
-                    hint = '\n\nℹ Это проблема авторизации выбранного Claude-маршрута. Я обновлю OAuth/переключу маршрут; повтори запрос.';
+                    const authRefreshText = [
+                        state.authRefresh && state.authRefresh.error,
+                        state.authRefresh && state.authRefresh.stdoutTail,
+                        state.authRefresh && state.authRefresh.stderrTail
+                    ].filter(Boolean).join(' ');
+                    if (state.authRefresh && state.authRefresh.ok === false && /No quota-eligible|нет свободного|ниже резерв/i.test(authRefreshText)) {
+                        hint = '\n\nℹ Плохой Claude-маршрут заблокирован, но сейчас нет свободного аккаунта выше резервов. Повтори позже, когда освободится 5ч/7д лимит.';
+                    } else {
+                        hint = '\n\nℹ Это проблема авторизации выбранного Claude-маршрута. Я обновлю OAuth/переключу маршрут; повтори запрос.';
+                    }
                 } else if (!quotaNotice && sid) {
                     hint = '\n\nℹ Сессия сохранена. Просто напиши «продолжай» — попробую с того же места.';
                 }

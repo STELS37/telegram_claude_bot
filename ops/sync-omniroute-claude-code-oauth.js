@@ -332,6 +332,7 @@ function selectConnection(db) {
     refresh: classify(refreshToken),
   });
 })().catch((err) => {
+  clearRuntimeEnv();
   console.error(JSON.stringify({ ok: false, error: String((err && err.message) || err).replace(/sk-ant-[A-Za-z0-9_-]+/g, '[redacted-token]') }));
   process.exit(1);
 });

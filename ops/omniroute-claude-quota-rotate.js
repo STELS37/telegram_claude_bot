@@ -348,9 +348,9 @@ function analyzeConnection(conn, snapshots, caches, nowMs) {
     reasons.push(`token expires at ${conn.expires_at}`);
   }
 
-  const quotaBlocked = reasons.some((reason) => reason.includes('remaining'));
+  const quotaBlocked = !externallyRateLimited && reasons.some((reason) => reason.includes('remaining'));
   const blockUntilMs =
-    quotaResetTimes.length > 0 ? Math.max(...quotaResetTimes) : quotaBlocked ? nowMs + FALLBACK_BLOCK_MS : null;
+    quotaResetTimes.length > 0 && !externallyRateLimited ? Math.max(...quotaResetTimes) : quotaBlocked ? nowMs + FALLBACK_BLOCK_MS : null;
 
   const sessionScore = session.remaining === null ? 0 : session.remaining;
   const weeklyScore = weekly.remaining === null ? 0 : weekly.remaining;

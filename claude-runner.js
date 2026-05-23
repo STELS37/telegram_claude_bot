@@ -168,8 +168,32 @@ function markClaudeAuthCredentialRoute(home, errorText) {
             const now = new Date();
             const nowIso = now.toISOString();
             const blockUntil = new Date(now.getTime() + 2 * 60 * 60 * 1000).toISOString();
-            const info = db.prepare(
-                `UPDATE provider_connections
+            const row = db.prepare(
+                `SELECT refresh_token, provider_specific_data
+                   FROM provider_connections
+                  WHERE provider = 'claude' AND id = ?`
+            ).get(sync.connectionId) || {};
+            let providerData = {};
+            try { providerData = row.provider_specific_data ? JSON.parse(row.provider_specific_data) : {}; } catch {}
+            const accessOnly = providerData.authMethod === 'long_lived_access_token'
+                || providerData.noRefresh === true
+                || !row.refresh_token
+                || sync.authMethod === 'long_lived_access_token';
+            const sql = accessOnly
+                ? `UPDATE provider_connections
+                    SET is_active = 0,
+                        rate_limited_until = NULL,
+                        test_status = 'expired',
+                        error_code = ?,
+                        last_error = ?,
+                        last_error_at = ?,
+                        last_error_type = ?,
+                        last_error_source = ?,
+                        priority = CASE WHEN priority < 99 THEN 99 ELSE priority END,
+                        updated_at = ?
+                  WHERE provider = 'claude'
+                    AND id = ?`
+                : `UPDATE provider_connections
                     SET rate_limited_until = ?,
                         error_code = ?,
                         last_error = ?,
@@ -179,22 +203,34 @@ function markClaudeAuthCredentialRoute(home, errorText) {
                         priority = CASE WHEN priority < 90 THEN 90 ELSE priority END,
                         updated_at = ?
                   WHERE provider = 'claude'
-                    AND id = ?`
-            ).run(
-                blockUntil,
-                'invalid_auth_credentials',
-                'Claude Code reported invalid authentication credentials',
-                nowIso,
-                'auth',
-                'claude_code_cli_auth',
-                nowIso,
-                sync.connectionId
-            );
+                    AND id = ?`;
+            const params = accessOnly
+                ? [
+                    'invalid_auth_credentials',
+                    'Claude Code reported invalid authentication credentials for access-only token; disabled until reimport',
+                    nowIso,
+                    'auth',
+                    'claude_code_cli_auth',
+                    nowIso,
+                    sync.connectionId
+                ]
+                : [
+                    blockUntil,
+                    'invalid_auth_credentials',
+                    'Claude Code reported invalid authentication credentials',
+                    nowIso,
+                    'auth',
+                    'claude_code_cli_auth',
+                    nowIso,
+                    sync.connectionId
+                ];
+            const info = db.prepare(sql).run(...params);
             return {
                 ok: info.changes > 0,
                 connectionId: sync.connectionId,
                 connectionName: sync.connectionName || null,
-                blockUntil
+                accessOnlyDisabled: accessOnly,
+                blockUntil: accessOnly ? null : blockUntil
             };
         } finally {
             db.close();
@@ -778,6 +814,32 @@ function stopChild(signal = 'SIGTERM') {
     }
 }
 
+function failFastAuthRetry(event, launch) {
+    if (!event || event.type !== 'system' || event.subtype !== 'api_retry') return false;
+    if (Number(event.error_status) !== 401) return false;
+    if (terminalStateWritten) return true;
+    terminalStateWritten = true;
+    const errMsg = 'Failed to authenticate. API Error: 401 Invalid authentication credentials';
+    const authRouteBlock = markClaudeAuthCredentialRoute(launch.home, errMsg);
+    const authRefresh = forceRefreshClaudeOAuthAfterAuthError(errMsg);
+    const nowIso = new Date().toISOString();
+    mergeState({
+        status: 'error',
+        finishedAt: nowIso,
+        error: errMsg,
+        api_error_status: 401,
+        observedSessionId,
+        session_id: event.session_id || observedSessionId || null,
+        result: errMsg,
+        authRouteBlock,
+        authRefresh,
+        failFastReason: 'auth_api_retry_401'
+    });
+    stopChild('SIGTERM');
+    setTimeout(() => stopChild('SIGKILL'), 1500).unref();
+    return true;
+}
+
 function handleExternalSignal(signal) {
     const current = readJson(stateFile, {});
     const patch = {
@@ -842,6 +904,10 @@ try {
                 eventCount += 1;
                 if (event.session_id && !observedSessionId) observedSessionId = event.session_id;
                 if (event.type === 'system' && event.session_id) observedSessionId = event.session_id;
+                if (failFastAuthRetry(event, launch)) {
+                    appendEvent(event);
+                    continue;
+                }
                 if (event.type === 'result') {
                     lastResultEvent = event;
                     if (!terminalStateWritten) {
