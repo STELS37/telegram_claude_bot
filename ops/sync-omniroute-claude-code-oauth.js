@@ -14,6 +14,8 @@ const RUNTIME_ENV_PATH = '/root/.claude/.omniroute-runtime-env.json';
 const ROTATOR_PATH = '/usr/local/sbin/omniroute-claude-quota-rotate.js';
 const LIMIT_CACHE_PATH = '/usr/local/sbin/claude-long-lived-limit-cache.js';
 const PROVIDER_LIMITS_REFRESH_PATH = '/usr/local/sbin/omniroute-provider-limits-refresh.sh';
+const IMPORT_PATH = '/usr/local/sbin/import-claude-code-oauth-to-omniroute.js';
+const BOT_ROOT = '/a0/usr/projects/telegram_claude_bot';
 const REFRESH_BEFORE_MS = 2 * 60 * 60 * 1000;
 const LONG_LIVED_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
 const FORCE = process.argv.includes('--force');
@@ -167,6 +169,33 @@ function clearSyncedClaudeAuth() {
   try { fs.rmSync(SYNC_META_PATH, { force: true }); } catch {}
 }
 
+function recoverBotRunCredentials() {
+  if (!fs.existsSync(IMPORT_PATH) || !fs.existsSync(BOT_ROOT)) return { ok: true, skipped: true, reason: 'import script or bot root missing' };
+  const find = spawnSync('find', [BOT_ROOT, '-path', '*/home/.claude/.omniroute-sync.json', '-type', 'f', '-mtime', '-14', '-print0'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 30 * 1000,
+  });
+  if (find.error || find.status !== 0) {
+    return { ok: false, error: find.error ? find.error.message : (find.stderr || '').toString('utf8').slice(-500) };
+  }
+  const metas = (find.stdout || Buffer.alloc(0)).toString('utf8').split('\0').filter(Boolean);
+  let checked = 0;
+  let imported = 0;
+  for (const meta of metas) {
+    const home = meta.slice(0, -'/.claude/.omniroute-sync.json'.length);
+    if (!home || !fs.existsSync(path.join(home, '.claude', '.credentials.json'))) continue;
+    checked += 1;
+    const result = spawnSync(process.execPath, [IMPORT_PATH, '--home', home, '--quiet'], {
+      cwd: PROJECT,
+      env: { ...process.env },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 30 * 1000,
+    });
+    if (!result.error && result.status === 0) imported += 1;
+  }
+  return { ok: true, checked, imported };
+}
+
 function writeClaudeCredentials(accessToken, refreshToken, expiresAtMs, scopes) {
   fs.mkdirSync(path.dirname(CREDENTIALS_PATH), { recursive: true, mode: 0o700 });
   const existing = readClaudeCredentials();
@@ -311,6 +340,7 @@ function selectConnection(db) {
 }
 
 (async () => {
+  recoverBotRunCredentials();
   if (ALLOW_ESTIMATED_LONG_LIVED_QUOTA) seedLongLivedLimitCache();
   refreshProviderLimitsCache();
   const db = loadDb();

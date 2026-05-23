@@ -21,6 +21,9 @@ const ROOT_CLAUDE_DIR = '/root/.claude';
 const RUNTIME_ENV_PATH = path.join(ROOT_CLAUDE_DIR, '.omniroute-runtime-env.json');
 const OMNIROUTE_PROJECT = '/a0/usr/projects/omniroute';
 const OMNIROUTE_DB_PATH = '/var/lib/omniroute/storage.sqlite';
+const ROUTE_LEASE_DIR = process.env.CLAUDE_ROUTE_LEASE_DIR || '/run/omniroute-claude-route-leases';
+let claudeRouteLeasePath = null;
+
 const FULL_ACCESS_TOOLS = [
     'Bash(*)',
     'Read(*)',
@@ -47,6 +50,48 @@ function writeJsonAtomic(file, value) {
     const tmp = `${file}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(value, null, 2));
     fs.renameSync(tmp, file);
+}
+
+function safeFilePart(value) {
+    return String(value || '').replace(/[^A-Za-z0-9_.-]+/g, '_').slice(0, 120) || 'job';
+}
+
+function readClaudeSyncMeta(home) {
+    const metaPath = path.join(home, '.claude', '.omniroute-sync.json');
+    return readJson(metaPath, null);
+}
+
+function createClaudeRouteLease(home, warnings) {
+    const meta = readClaudeSyncMeta(home);
+    if (!meta || meta.provider !== 'claude' || !meta.connectionId) return null;
+    fs.mkdirSync(ROUTE_LEASE_DIR, { recursive: true, mode: 0o700 });
+    const lease = {
+        provider: 'claude',
+        connectionId: meta.connectionId,
+        connectionName: meta.connectionName || null,
+        ownerPid: process.pid,
+        jobDir,
+        stateFile,
+        createdAt: new Date().toISOString()
+    };
+    const file = path.join(ROUTE_LEASE_DIR, safeFilePart(meta.connectionId) + '.' + process.pid + '.' + safeFilePart(path.basename(jobDir)) + '.json');
+    fs.writeFileSync(file, JSON.stringify(lease, null, 2) + '\n', { mode: 0o600 });
+    fs.chmodSync(file, 0o600);
+    claudeRouteLeasePath = file;
+    if (warnings) warnings.push('Claude route leased: ' + (meta.connectionName || meta.connectionId));
+    return lease;
+}
+
+function releaseClaudeRouteLease() {
+    if (!claudeRouteLeasePath) return { ok: true, skipped: true };
+    const file = claudeRouteLeasePath;
+    claudeRouteLeasePath = null;
+    try {
+        fs.rmSync(file, { force: true });
+        return { ok: true, file };
+    } catch (err) {
+        return { ok: false, file, error: err.message };
+    }
 }
 
 function mergeState(patch) {
@@ -413,6 +458,7 @@ function readableNonQuotaReason(reason) {
         const why = translateRealQuotaProblem(realQuota[2]);
         return label + ': нет свежей реальной проверки лимита' + (why ? ' (' + why + ')' : '');
     }
+    if (/active Claude job lease/i.test(text)) return 'аккаунт уже занят другим активным Claude job';
     if (/external rate limit until/i.test(text)) return 'маршрут временно заблокирован после ошибки авторизации';
     if (/token expires at/i.test(text)) return 'OAuth-токен истёк или требует refresh';
     if (/missing refresh token/i.test(text)) return 'нет refresh token';
@@ -690,6 +736,7 @@ function prepareClaudeLaunch(config) {
 
             copyIfExists(path.join(ROOT_CLAUDE_DIR, '.omniroute-sync.json'), path.join(isolatedClaudeDir, '.omniroute-sync.json'), 0o600);
             applyClaudeRuntimeEnv(childEnv, warnings);
+            createClaudeRouteLease(isolatedHome, warnings);
             copyIfExists(path.join(ROOT_CLAUDE_DIR, 'settings.json'), path.join(isolatedClaudeDir, 'settings.json'), 0o600);
             copyIfExists(path.join(ROOT_CLAUDE_DIR, 'policy-limits.json'), path.join(isolatedClaudeDir, 'policy-limits.json'), 0o600);
             linkClaudeProjects(isolatedClaudeDir, warnings);
@@ -990,6 +1037,8 @@ try {
                     if (!terminalStateWritten) {
                         terminalStateWritten = true;
                         const errMsg = event.is_error ? resultErrorMessage(event, stderrBuf) : '';
+                        const authError = errMsg ? isClaudeAuthCredentialError(errMsg) : false;
+                        const authPreImport = authError && launch.launchMode === 'isolated-home' ? importClaudeOAuthBack(launch.home) : null;
                         const monthlyLimitBlock = errMsg ? markClaudeMonthlyUsageLimit(launch.home, errMsg) : null;
                         const authRouteBlock = errMsg ? markClaudeAuthCredentialRoute(launch.home, errMsg) : null;
                         const authRefresh = errMsg ? forceRefreshClaudeOAuthAfterAuthError(errMsg, authRouteBlock && authRouteBlock.connectionId) : null;
@@ -997,6 +1046,7 @@ try {
                             resultReadyAt: new Date().toISOString(),
                             monthlyLimitBlock,
                             authRouteBlock,
+                            authPreImport,
                             authRefresh
                         }));
                         setTimeout(() => {
@@ -1045,6 +1095,7 @@ try {
 
     proc.on('close', (code, signal) => {
         const oauthImportResult = launch.launchMode === 'isolated-home' ? importClaudeOAuthBack(launch.home) : null;
+        const routeLeaseRelease = releaseClaudeRouteLease();
         const current = readJson(stateFile, {});
         const stopRequested = !!current.stopRequestedAt && !!current.stopRequestedBy;
         const externalSignal = !stopRequested && current.externalSignal;
@@ -1055,7 +1106,8 @@ try {
             observedSessionId,
             stderrTail: tailText(stderrBuf),
             stdoutTail: tailText(stdoutBuf),
-            oauthImport: oauthImportResult
+            oauthImport: oauthImportResult,
+            routeLeaseRelease
         };
         if (terminalStateWritten) {
             mergeState({

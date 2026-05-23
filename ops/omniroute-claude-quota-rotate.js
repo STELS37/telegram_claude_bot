@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
+const fs = require('fs');
 const path = require('path');
 
 const PROJECT = process.env.OMNIROUTE_PROJECT || '/a0/usr/projects/omniroute';
@@ -26,6 +27,7 @@ const QUOTA_STALE_MS = numberEnv('CLAUDE_ROTATE_QUOTA_STALE_MS', 2 * 60 * 60 * 1
 const QUOTA_VERY_STALE_MS = numberEnv('CLAUDE_ROTATE_QUOTA_VERY_STALE_MS', 24 * 60 * 60 * 1000);
 const FRESH_QUOTA_MAX_AGE_MS = numberEnv('CLAUDE_ROTATE_FRESH_QUOTA_MAX_AGE_MS', 90 * 60 * 1000);
 const REQUIRE_REAL_QUOTA = boolEnv('CLAUDE_ROTATE_REQUIRE_REAL_QUOTA', true);
+const ROUTE_LEASE_DIR = process.env.CLAUDE_ROUTE_LEASE_DIR || '/run/omniroute-claude-route-leases';
 
 function numberEnv(name, fallback) {
   const value = Number(process.env[name]);
@@ -36,6 +38,63 @@ function boolEnv(name, fallback) {
   const raw = process.env[name];
   if (raw === undefined || raw === null || raw === '') return fallback;
   return /^(1|true|yes|on)$/i.test(String(raw).trim());
+}
+
+function safeReadJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function unlinkQuietly(file) {
+  try { fs.rmSync(file, { force: true }); } catch {}
+}
+
+function runnerPidOwnsJob(pid, jobDir) {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) return false;
+  try {
+    process.kill(numericPid, 0);
+  } catch {
+    return false;
+  }
+  try {
+    const cmdline = fs.readFileSync('/proc/' + numericPid + '/cmdline', 'utf8').replace(/\0/g, ' ');
+    if (!cmdline.includes('claude-runner.js')) return false;
+    if (jobDir && !cmdline.includes(String(jobDir))) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function activeRouteLeases() {
+  const byConnection = new Map();
+  let entries = [];
+  try {
+    entries = fs.readdirSync(ROUTE_LEASE_DIR, { withFileTypes: true });
+  } catch {
+    return byConnection;
+  }
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    const file = path.join(ROUTE_LEASE_DIR, entry.name);
+    const lease = safeReadJson(file);
+    if (!lease || lease.provider !== PROVIDER || !lease.connectionId) {
+      unlinkQuietly(file);
+      continue;
+    }
+    if (!runnerPidOwnsJob(lease.ownerPid, lease.jobDir)) {
+      unlinkQuietly(file);
+      continue;
+    }
+    lease.file = file;
+    if (!byConnection.has(lease.connectionId)) byConnection.set(lease.connectionId, []);
+    byConnection.get(lease.connectionId).push(lease);
+  }
+  return byConnection;
 }
 
 const THRESHOLDS = {
@@ -494,7 +553,7 @@ function buildRotationScore(conn, session, weekly, headroomScore, ownQuotaMarker
   };
 }
 
-function analyzeConnection(conn, snapshots, caches, nowMs) {
+function analyzeConnection(conn, snapshots, caches, nowMs, leasesByConnection = new Map()) {
   const connectionSnapshots = snapshots.get(conn.id) || new Map();
   const cacheEntry = caches.get(conn.id) || null;
   const session = markRealQuota(applyBootstrapStatus(conn, pickWindowStatus(connectionSnapshots.get(SESSION_WINDOW), cacheEntry, SESSION_WINDOW, nowMs), SESSION_WINDOW, nowMs));
@@ -503,6 +562,8 @@ function analyzeConnection(conn, snapshots, caches, nowMs) {
   const ownQuotaMarker = conn.last_error_source === QUOTA_ERROR_SOURCE || conn.error_code === QUOTA_ERROR_CODE;
   const rateLimitedMs = parseDateMs(conn.rate_limited_until);
   const externallyRateLimited = rateLimitedMs !== null && rateLimitedMs > nowMs && !ownQuotaMarker;
+  const activeLeases = leasesByConnection.get(conn.id) || [];
+  const leaseBlocked = activeLeases.length > 0;
 
   const reasons = [];
   if (REQUIRE_REAL_QUOTA) {
@@ -525,6 +586,9 @@ function analyzeConnection(conn, snapshots, caches, nowMs) {
   }
   if (externallyRateLimited) {
     reasons.push(`external rate limit until ${conn.rate_limited_until}`);
+  }
+  if (leaseBlocked) {
+    reasons.push(`active Claude job lease (${activeLeases.length})`);
   }
   const tokenExpiresMs = parseDateMs(conn.expires_at);
   if (!conn.has_access_token) {
@@ -560,6 +624,8 @@ function analyzeConnection(conn, snapshots, caches, nowMs) {
     eligible: reasons.length === 0,
     quotaBlocked,
     externallyRateLimited,
+    leaseBlocked,
+    activeLeaseCount: activeLeases.length,
     blockUntil: blockUntilMs === null ? null : iso(blockUntilMs),
     ownQuotaMarker,
     authMethod: isLongLivedAccessOnly(conn) ? 'long_lived_access_token' : 'oauth_refresh',
@@ -709,9 +775,10 @@ function rotateClaudeConnections(db, options = {}) {
   const nowMs = options.nowMs || Date.now();
   const connections = activeClaudeConnections(db);
   const excludedAccounts = inactiveClaudeConnections(db).map(inactiveClaudeAccount);
+  const activeLeases = activeRouteLeases();
   const snapshots = latestQuotaSnapshots(db);
   const caches = providerLimitsCache(db);
-  const statuses = connections.map((conn) => analyzeConnection(conn, snapshots, caches, nowMs));
+  const statuses = connections.map((conn) => analyzeConnection(conn, snapshots, caches, nowMs, activeLeases));
   const selected = buildPriorityPlan(statuses);
 
   if (options.apply !== false) {
@@ -731,6 +798,7 @@ function rotateClaudeConnections(db, options = {}) {
       longLivedReserveMaxConsecutiveMeasured: LONG_LIVED_RESERVE_MAX_CONSECUTIVE_MEASURED,
       requireRealQuota: REQUIRE_REAL_QUOTA,
       freshQuotaMaxAgeMinutes: Math.round(FRESH_QUOTA_MAX_AGE_MS / 60000),
+      activeLeaseCount: Array.from(activeLeases.values()).reduce((total, items) => total + items.length, 0),
     },
     selected: selected
       ? {
