@@ -18,6 +18,11 @@ const LONG_LIVED_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
 const FORCE = process.argv.includes('--force');
 const QUIET = process.argv.includes('--quiet');
 const MARK_USE = process.argv.includes('--mark-use') || process.env.CLAUDE_ROTATE_MARK_USE === '1';
+function argValue(name) {
+  const index = process.argv.indexOf(name);
+  return index >= 0 ? process.argv[index + 1] || '' : '';
+}
+const SELECT_CONNECTION_ID = argValue('--connection-id') || process.env.CLAUDE_SYNC_CONNECTION_ID || '';
 const DEFAULT_SCOPES = Object.freeze([
   'user:inference',
   'user:profile',
@@ -221,6 +226,11 @@ function seedLongLivedLimitCache() {
 
 function selectConnection(db) {
   const fields = 'id, name, access_token, refresh_token, expires_at, scope, provider_specific_data';
+  if (SELECT_CONNECTION_ID) {
+    const row = db.prepare(`SELECT ${fields} FROM provider_connections WHERE provider = 'claude' AND is_active = 1 AND id = ?`).get(SELECT_CONNECTION_ID);
+    if (!row) throw new Error(`Requested Claude connection is not active or not found: ${SELECT_CONNECTION_ID}`);
+    return { row, selection: { selected: { id: row.id, score: null, rotationScore: null }, thresholds: null } };
+  }
   if (fs.existsSync(ROTATOR_PATH)) {
     const { rotateClaudeConnections } = require(ROTATOR_PATH);
     const selection = rotateClaudeConnections(db, { apply: true });
@@ -292,6 +302,9 @@ function selectConnection(db) {
                 error_code = NULL,
                 last_error = NULL,
                 last_error_at = NULL,
+                last_error_type = NULL,
+                last_error_source = NULL,
+                rate_limited_until = NULL,
                 updated_at = ?
           WHERE id = ?`
       ).run(

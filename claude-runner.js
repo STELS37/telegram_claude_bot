@@ -240,13 +240,15 @@ function markClaudeAuthCredentialRoute(home, errorText) {
     }
 }
 
-function forceRefreshClaudeOAuthAfterAuthError(errorText) {
+function forceRefreshClaudeOAuthAfterAuthError(errorText, connectionId = null) {
     if (!isClaudeAuthCredentialError(errorText)) return null;
     if (!fs.existsSync(OAUTH_SYNC_PATH)) return { ok: false, reason: 'oauth sync script missing' };
 
     try {
         return withFileLock('/tmp/claude-oauth-sync.lock', () => {
-            const sync = spawnSync(process.execPath, [OAUTH_SYNC_PATH, '--force', '--quiet'], {
+            const args = [OAUTH_SYNC_PATH, '--force', '--quiet'];
+            if (connectionId) args.push('--connection-id', connectionId);
+            const sync = spawnSync(process.execPath, args, {
                 cwd: '/root',
                 env: { ...process.env },
                 stdio: ['ignore', 'pipe', 'pipe'],
@@ -856,7 +858,7 @@ function failFastAuthRetry(event, launch) {
     terminalStateWritten = true;
     const errMsg = 'Failed to authenticate. API Error: 401 Invalid authentication credentials';
     const authRouteBlock = markClaudeAuthCredentialRoute(launch.home, errMsg);
-    const authRefresh = forceRefreshClaudeOAuthAfterAuthError(errMsg);
+    const authRefresh = forceRefreshClaudeOAuthAfterAuthError(errMsg, authRouteBlock && authRouteBlock.connectionId);
     const nowIso = new Date().toISOString();
     mergeState({
         status: 'error',
@@ -950,7 +952,7 @@ try {
                         const errMsg = event.is_error ? resultErrorMessage(event, stderrBuf) : '';
                         const monthlyLimitBlock = errMsg ? markClaudeMonthlyUsageLimit(launch.home, errMsg) : null;
                         const authRouteBlock = errMsg ? markClaudeAuthCredentialRoute(launch.home, errMsg) : null;
-                        const authRefresh = errMsg ? forceRefreshClaudeOAuthAfterAuthError(errMsg) : null;
+                        const authRefresh = errMsg ? forceRefreshClaudeOAuthAfterAuthError(errMsg, authRouteBlock && authRouteBlock.connectionId) : null;
                         mergeState(terminalStateFromResult(event, observedSessionId, stderrBuf, {
                             resultReadyAt: new Date().toISOString(),
                             monthlyLimitBlock,
@@ -1047,7 +1049,7 @@ try {
             const errMsg = resultErrorMessage(lastResultEvent, stderrBuf);
             const monthlyLimitBlock = markClaudeMonthlyUsageLimit(launch.home, errMsg);
             const authRouteBlock = markClaudeAuthCredentialRoute(launch.home, errMsg);
-            const authRefresh = forceRefreshClaudeOAuthAfterAuthError(errMsg);
+            const authRefresh = forceRefreshClaudeOAuthAfterAuthError(errMsg, authRouteBlock && authRouteBlock.connectionId);
             mergeState({
                 ...base,
                 monthlyLimitBlock,
