@@ -22,10 +22,20 @@ const TOKEN_EXPIRY_BUFFER_MS = numberEnv('CLAUDE_ROTATE_TOKEN_EXPIRY_BUFFER_MS',
 const LONG_LIVED_RESERVE_SESSION_FLOOR = numberEnv('CLAUDE_ROTATE_LONG_LIVED_RESERVE_SESSION_FLOOR', 65);
 const LONG_LIVED_RESERVE_WEEKLY_FLOOR = numberEnv('CLAUDE_ROTATE_LONG_LIVED_RESERVE_WEEKLY_FLOOR', 30);
 const LONG_LIVED_RESERVE_MAX_CONSECUTIVE_MEASURED = numberEnv('CLAUDE_ROTATE_LONG_LIVED_RESERVE_MAX_CONSECUTIVE_MEASURED', 3);
+const QUOTA_STALE_MS = numberEnv('CLAUDE_ROTATE_QUOTA_STALE_MS', 2 * 60 * 60 * 1000);
+const QUOTA_VERY_STALE_MS = numberEnv('CLAUDE_ROTATE_QUOTA_VERY_STALE_MS', 24 * 60 * 60 * 1000);
+const FRESH_QUOTA_MAX_AGE_MS = numberEnv('CLAUDE_ROTATE_FRESH_QUOTA_MAX_AGE_MS', 90 * 60 * 1000);
+const REQUIRE_REAL_QUOTA = boolEnv('CLAUDE_ROTATE_REQUIRE_REAL_QUOTA', true);
 
 function numberEnv(name, fallback) {
   const value = Number(process.env[name]);
   return Number.isFinite(value) ? value : fallback;
+}
+
+function boolEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  return /^(1|true|yes|on)$/i.test(String(raw).trim());
 }
 
 const THRESHOLDS = {
@@ -50,6 +60,16 @@ function parseDateMs(value) {
   return Number.isFinite(ms) ? ms : null;
 }
 
+function quotaAgeFields(observedMs, nowMs, estimated = false) {
+  const ageMs = Number.isFinite(observedMs) && observedMs > 0 ? Math.max(0, nowMs - observedMs) : null;
+  return {
+    ageSeconds: ageMs === null ? null : Math.round(ageMs / 1000),
+    stale: ageMs !== null && ageMs > QUOTA_STALE_MS,
+    veryStale: ageMs !== null && ageMs > QUOTA_VERY_STALE_MS,
+    estimated: Boolean(estimated),
+  };
+}
+
 function iso(ms) {
   return new Date(ms).toISOString();
 }
@@ -66,6 +86,11 @@ function safeJson(raw) {
   } catch {
     return null;
   }
+}
+
+function snapshotMeta(row) {
+  const parsed = safeJson(row && row.raw_data);
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
 }
 
 function activeClaudeConnections(db) {
@@ -139,8 +164,15 @@ function remainingFromQuota(quota) {
 
 function candidateFromSnapshot(row, nowMs) {
   if (!row) return null;
+  const meta = snapshotMeta(row);
   const resetMs = parseDateMs(row.next_reset_at);
   const observedMs = parseDateMs(row.created_at) || resetMs || 0;
+  const metaFields = {
+    providerSource: meta.source || null,
+    sourceNote: meta.note || null,
+    sourceReason: meta.reason || null,
+    actualUsageAvailable: meta.actualUsageAvailable ?? null,
+  };
   if (resetMs !== null && resetMs <= nowMs) {
     return {
       remaining: 100,
@@ -150,6 +182,8 @@ function candidateFromSnapshot(row, nowMs) {
       observedMs,
       source: 'snapshot-reset-passed',
       snapshotAt: row.created_at || null,
+      ...metaFields,
+      ...quotaAgeFields(observedMs, nowMs, true),
     };
   }
   const remaining = clampPercent(row.remaining_percentage);
@@ -162,6 +196,8 @@ function candidateFromSnapshot(row, nowMs) {
     observedMs,
     source: 'snapshot',
     snapshotAt: row.created_at || null,
+    ...metaFields,
+    ...quotaAgeFields(observedMs, nowMs, false),
   };
 }
 
@@ -175,6 +211,12 @@ function candidateFromCache(entry, windowKey, nowMs) {
   const resetAt = quota && typeof quota === 'object' ? quota.resetAt || quota.nextResetAt || quota.next_reset_at || null : null;
   const resetMs = parseDateMs(resetAt);
   const observedMs = parseDateMs(entry.fetchedAt) || resetMs || 0;
+  const metaFields = {
+    providerSource: entry.source || null,
+    sourceNote: entry.note || null,
+    sourceReason: entry.reason || null,
+    actualUsageAvailable: entry.actualUsageAvailable ?? null,
+  };
   if (resetMs !== null && resetMs <= nowMs) {
     return {
       remaining: 100,
@@ -184,6 +226,8 @@ function candidateFromCache(entry, windowKey, nowMs) {
       observedMs,
       source: 'cache-reset-passed',
       snapshotAt: entry.fetchedAt || null,
+      ...metaFields,
+      ...quotaAgeFields(observedMs, nowMs, true),
     };
   }
   return {
@@ -194,6 +238,8 @@ function candidateFromCache(entry, windowKey, nowMs) {
     observedMs,
     source: 'cache',
     snapshotAt: entry.fetchedAt || null,
+    ...metaFields,
+    ...quotaAgeFields(observedMs, nowMs, false),
   };
 }
 
@@ -227,6 +273,10 @@ function applyBootstrapStatus(conn, status, windowKey, nowMs) {
     used: roundPercent(100 - remaining),
     source: 'bootstrap',
     snapshotAt: null,
+    ageSeconds: null,
+    stale: false,
+    veryStale: false,
+    estimated: true,
     thresholdReached: thresholdRemaining !== null && remaining < thresholdRemaining,
   };
 }
@@ -245,6 +295,16 @@ function pickWindowStatus(snapshotRow, cacheEntry, windowKey, nowMs) {
       resetAt: null,
       source: 'unknown',
       snapshotAt: null,
+      ageSeconds: null,
+      stale: false,
+      veryStale: false,
+      estimated: false,
+      providerSource: null,
+      sourceNote: null,
+      sourceReason: null,
+      actualUsageAvailable: null,
+      real: false,
+      realQuotaProblem: 'no quota telemetry',
       thresholdRemaining: THRESHOLDS[windowKey],
       thresholdReached: false,
     };
@@ -266,9 +326,55 @@ function pickWindowStatus(snapshotRow, cacheEntry, windowKey, nowMs) {
     resetAt: picked.resetAt,
     source: picked.source,
     snapshotAt: picked.snapshotAt,
+    ageSeconds: picked.ageSeconds ?? null,
+    stale: Boolean(picked.stale),
+    veryStale: Boolean(picked.veryStale),
+    estimated: Boolean(picked.estimated),
+    providerSource: picked.providerSource || null,
+    sourceNote: picked.sourceNote || null,
+    sourceReason: picked.sourceReason || null,
+    actualUsageAvailable: picked.actualUsageAvailable ?? null,
+    real: false,
+    realQuotaProblem: null,
     thresholdRemaining,
     thresholdReached,
   };
+}
+
+function quotaSourceText(status) {
+  return [
+    status && status.source,
+    status && status.providerSource,
+    status && status.sourceNote,
+    status && status.sourceReason,
+  ].filter(Boolean).join(' ').toLowerCase();
+}
+
+function realQuotaProblem(status) {
+  if (!status || status.remaining === null || status.remaining === undefined) return 'no quota value';
+  if (status.estimated || String(status.source || '').includes('reset-passed')) return 'estimated from reset time, not measured';
+  if (status.source === 'unknown') return 'unknown quota source';
+  if (status.source === 'bootstrap') return 'bootstrap quota, not measured';
+  if (status.ageSeconds === null || status.ageSeconds === undefined) return 'missing quota timestamp';
+  if (status.ageSeconds * 1000 > FRESH_QUOTA_MAX_AGE_MS) return 'quota data is stale';
+  if (status.actualUsageAvailable === false) return 'provider says actual usage is unavailable';
+  const text = quotaSourceText(status);
+  if (/long.?lived|estimated|bootstrap|user:inference|does not expose|no quota telemetry/.test(text)) {
+    return 'synthetic quota source';
+  }
+  return null;
+}
+
+function markRealQuota(status) {
+  if (!REQUIRE_REAL_QUOTA) {
+    status.real = true;
+    status.realQuotaProblem = null;
+    return status;
+  }
+  const problem = realQuotaProblem(status);
+  status.real = problem === null;
+  status.realQuotaProblem = problem;
+  return status;
 }
 
 function lastUsedAgeMs(conn, nowMs) {
@@ -290,11 +396,21 @@ function useRecencyScore(conn, nowMs) {
 function freshResetScore(session, weekly, ownQuotaMarker) {
   let score = 0;
   for (const status of [session, weekly]) {
+    if (status.stale || status.veryStale) continue;
     if (String(status.source || '').includes('reset-passed')) score += 18;
     else if (status.remaining === 100 && status.used === 0) score += 6;
   }
   if (ownQuotaMarker) score += 12;
   return Math.min(36, score);
+}
+
+function staleQuotaPenalty(session, weekly) {
+  const statuses = [session, weekly];
+  if (statuses.some((status) => status.veryStale && status.estimated)) return 35;
+  if (statuses.some((status) => status.veryStale)) return 20;
+  if (statuses.some((status) => status.stale && status.estimated)) return 12;
+  if (statuses.some((status) => status.stale)) return 6;
+  return 0;
 }
 
 function buildRotationScore(conn, session, weekly, headroomScore, ownQuotaMarker, nowMs) {
@@ -303,27 +419,37 @@ function buildRotationScore(conn, session, weekly, headroomScore, ownQuotaMarker
   const consecutiveUseCount = Number(conn.consecutive_use_count || 0);
   const consecutivePenalty = Math.min(30, consecutiveUseCount * 8);
   const priorityPenalty = Math.max(0, Number(conn.priority || 0)) * 0.03;
-  const rotationScore = headroomScore + recencyScore + resetScore - consecutivePenalty - priorityPenalty;
+  const stalePenalty = staleQuotaPenalty(session, weekly);
+  const rotationScore = headroomScore + recencyScore + resetScore - consecutivePenalty - priorityPenalty - stalePenalty;
   return {
     rotationScore: roundPercent(rotationScore),
     recencyScore,
     resetScore,
     consecutivePenalty,
     priorityPenalty: roundPercent(priorityPenalty),
+    stalePenalty,
   };
 }
 
 function analyzeConnection(conn, snapshots, caches, nowMs) {
   const connectionSnapshots = snapshots.get(conn.id) || new Map();
   const cacheEntry = caches.get(conn.id) || null;
-  const session = applyBootstrapStatus(conn, pickWindowStatus(connectionSnapshots.get(SESSION_WINDOW), cacheEntry, SESSION_WINDOW, nowMs), SESSION_WINDOW, nowMs);
-  const weekly = applyBootstrapStatus(conn, pickWindowStatus(connectionSnapshots.get(WEEKLY_WINDOW), cacheEntry, WEEKLY_WINDOW, nowMs), WEEKLY_WINDOW, nowMs);
+  const session = markRealQuota(applyBootstrapStatus(conn, pickWindowStatus(connectionSnapshots.get(SESSION_WINDOW), cacheEntry, SESSION_WINDOW, nowMs), SESSION_WINDOW, nowMs));
+  const weekly = markRealQuota(applyBootstrapStatus(conn, pickWindowStatus(connectionSnapshots.get(WEEKLY_WINDOW), cacheEntry, WEEKLY_WINDOW, nowMs), WEEKLY_WINDOW, nowMs));
 
   const ownQuotaMarker = conn.last_error_source === QUOTA_ERROR_SOURCE || conn.error_code === QUOTA_ERROR_CODE;
   const rateLimitedMs = parseDateMs(conn.rate_limited_until);
   const externallyRateLimited = rateLimitedMs !== null && rateLimitedMs > nowMs && !ownQuotaMarker;
 
   const reasons = [];
+  if (REQUIRE_REAL_QUOTA) {
+    for (const status of [session, weekly]) {
+      if (!status.real) {
+        const label = status.window === SESSION_WINDOW ? 'session' : 'weekly';
+        reasons.push(`${label} real quota unavailable: ${status.realQuotaProblem || 'unknown reason'}`);
+      }
+    }
+  }
   const quotaResetTimes = [];
   for (const status of [session, weekly]) {
     if (!status.thresholdReached) continue;
@@ -539,6 +665,8 @@ function rotateClaudeConnections(db, options = {}) {
       longLivedReserveSessionFloor: LONG_LIVED_RESERVE_SESSION_FLOOR,
       longLivedReserveWeeklyFloor: LONG_LIVED_RESERVE_WEEKLY_FLOOR,
       longLivedReserveMaxConsecutiveMeasured: LONG_LIVED_RESERVE_MAX_CONSECUTIVE_MEASURED,
+      requireRealQuota: REQUIRE_REAL_QUOTA,
+      freshQuotaMaxAgeMinutes: Math.round(FRESH_QUOTA_MAX_AGE_MS / 60000),
     },
     selected: selected
       ? {

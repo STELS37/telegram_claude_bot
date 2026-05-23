@@ -371,9 +371,16 @@ function shortAccountName(account) {
     return id ? 'Без названия (' + id.slice(0, 8) + ')' : 'Claude account';
 }
 
+function quotaValueText(status) {
+    if (!status) return '?';
+    if (status.real === false) return 'нет свежей проверки';
+    return percentText(status.remaining) + '%';
+}
+
 function quotaStatusText(status) {
-    const remaining = percentText(status && status.remaining);
     const threshold = percentText(status && status.thresholdRemaining);
+    if (status && status.real === false) return 'нет свежей реальной проверки (нужно ' + threshold + '%+)';
+    const remaining = percentText(status && status.remaining);
     return remaining + '% (нужно ' + threshold + '%+)';
 }
 
@@ -385,8 +392,27 @@ function availabilityLine(account) {
     return availableAt;
 }
 
+function translateRealQuotaProblem(reason) {
+    const text = String(reason || '').toLowerCase();
+    if (text.includes('estimated from reset time')) return 'это оценка по resetAt, не измерение';
+    if (text.includes('stale')) return 'данные старые';
+    if (text.includes('synthetic')) return 'синтетический источник';
+    if (text.includes('bootstrap')) return 'bootstrap, не измерение';
+    if (text.includes('actual usage is unavailable')) return 'провайдер не отдал usage';
+    if (text.includes('no quota value')) return 'нет значения';
+    if (text.includes('missing quota timestamp')) return 'нет времени проверки';
+    if (text.includes('unknown')) return 'источник неизвестен';
+    return String(reason || '').trim();
+}
+
 function readableNonQuotaReason(reason) {
     const text = String(reason || '');
+    const realQuota = text.match(/^(session|weekly) real quota unavailable:\s*(.*)$/i);
+    if (realQuota) {
+        const label = realQuota[1].toLowerCase() === 'session' ? '5 часов' : '7 дней';
+        const why = translateRealQuotaProblem(realQuota[2]);
+        return label + ': нет свежей реальной проверки лимита' + (why ? ' (' + why + ')' : '');
+    }
     if (/external rate limit until/i.test(text)) return 'маршрут временно заблокирован после ошибки авторизации';
     if (/token expires at/i.test(text)) return 'OAuth-токен истёк или требует refresh';
     if (/missing refresh token/i.test(text)) return 'нет refresh token';
@@ -417,7 +443,7 @@ function freshnessText(account) {
 }
 
 function accountReserveLine(account) {
-    return '5ч ' + percentText(account.session && account.session.remaining) + '%, 7д ' + percentText(account.weekly && account.weekly.remaining) + '%';
+    return '5ч ' + quotaValueText(account.session) + ', 7д ' + quotaValueText(account.weekly);
 }
 
 function hasStaleQuotaData(account) {
@@ -431,9 +457,9 @@ function buildAccountLine(account, index) {
     const stale = hasStaleQuotaData(account);
     return [
         String(index + 1) + '. ' + shortAccountName(account) + ' — ' + availabilityLine(account),
-        '   Остаток: ' + accountReserveLine(account) + '.',
+        '   Лимиты: ' + accountReserveLine(account) + '.',
         '   Не проходит: ' + blockerText(account) + '.',
-        stale ? '   Данные лимитов старые; причина блокировки может быть не в лимитах.' : null
+        stale ? '   Старые/оценочные значения не используются для запуска Opus.' : null
     ].filter(Boolean).join('\n');
 }
 
@@ -486,11 +512,11 @@ function buildOmniRouteQuotaStatusMessage() {
         : ['Ближайший запуск Opus 4.7: нет данных.'];
 
     return [
-        'Сейчас Opus 4.7 запускать нельзя: нет Claude-маршрута выше резервов и без блокировок.',
+        'Сейчас Opus 4.7 запускать нельзя: нет Claude-маршрута со свежими реальными лимитами выше резервов.',
         '',
         ...nextLines,
         '',
-        'Правило резерва: 5ч >= ' + (thresholds.sessionMinRemaining ?? 50) + '%, 7д >= ' + (thresholds.weeklyMinRemaining ?? 20) + '%.',
+        'Правило резерва: 5ч >= ' + (thresholds.sessionMinRemaining ?? 50) + '%, 7д >= ' + (thresholds.weeklyMinRemaining ?? 20) + '%. Лимит считается реальным только после свежей проверки provider-limits.',
         '',
         'Все аккаунты (' + accounts.length + '):',
         ...accounts.map(buildAccountLine)

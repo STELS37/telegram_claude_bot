@@ -131,6 +131,11 @@ function sameMinuteIso(a, b) {
     const newRefreshHash = hashToken(refreshToken);
     const currentExpiresMs = row.expires_at ? Date.parse(row.expires_at) : 0;
     const newExpiresIso = new Date(expiresAtMs).toISOString();
+    const invalidGrant = row.error_code === 'invalid_grant' || row.last_error_type === 'invalid_grant' || row.test_status === 'expired';
+    if (invalidGrant && currentRefreshHash === newRefreshHash) {
+      log({ ok: true, skipped: true, reason: 'same rejected refresh token', connectionId: row.id }, args.quiet);
+      return;
+    }
 
     if (currentRefresh && currentRefreshHash !== meta.refreshHash && currentExpiresMs >= expiresAtMs && !sameMinuteIso(row.expires_at, newExpiresIso)) {
       log({ ok: true, skipped: true, reason: 'DB already has a newer/different refresh token', connectionId: row.id }, args.quiet);
@@ -144,7 +149,7 @@ function sameMinuteIso(a, b) {
     }
 
     const scopes = Array.isArray(oauth.scopes) ? oauth.scopes.join(' ') : null;
-    const shouldReactivate = row.is_active === 1 || row.error_code === 'invalid_grant' || row.last_error_type === 'invalid_grant' || row.test_status === 'expired';
+    const shouldReactivate = row.is_active === 1 || currentRefreshHash !== newRefreshHash;
     db.prepare(`UPDATE provider_connections
       SET access_token = ?,
           refresh_token = ?,

@@ -13,11 +13,14 @@ const SYNC_META_PATH = '/root/.claude/.omniroute-sync.json';
 const RUNTIME_ENV_PATH = '/root/.claude/.omniroute-runtime-env.json';
 const ROTATOR_PATH = '/usr/local/sbin/omniroute-claude-quota-rotate.js';
 const LIMIT_CACHE_PATH = '/usr/local/sbin/claude-long-lived-limit-cache.js';
+const PROVIDER_LIMITS_REFRESH_PATH = '/usr/local/sbin/omniroute-provider-limits-refresh.sh';
 const REFRESH_BEFORE_MS = 2 * 60 * 60 * 1000;
 const LONG_LIVED_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
 const FORCE = process.argv.includes('--force');
 const QUIET = process.argv.includes('--quiet');
 const MARK_USE = process.argv.includes('--mark-use') || process.env.CLAUDE_ROTATE_MARK_USE === '1';
+const ALLOW_ESTIMATED_LONG_LIVED_QUOTA = /^(1|true|yes|on)$/i.test(String(process.env.CLAUDE_ALLOW_ESTIMATED_LONG_LIVED_QUOTA || ''));
+const SKIP_PROVIDER_LIMITS_REFRESH = /^(1|true|yes|on)$/i.test(String(process.env.CLAUDE_SYNC_SKIP_PROVIDER_LIMITS_REFRESH || ''));
 function argValue(name) {
   const index = process.argv.indexOf(name);
   return index >= 0 ? process.argv[index + 1] || '' : '';
@@ -224,6 +227,50 @@ function seedLongLivedLimitCache() {
   }
 }
 
+function markInvalidRefreshToken(db, row, err) {
+  const message = String((err && err.message) || err || '');
+  if (!/invalid_grant/i.test(message) || !row || !row.id) return;
+  const nowIso = new Date().toISOString();
+  db.prepare(
+    `UPDATE provider_connections
+        SET is_active = 0,
+            test_status = 'expired',
+            error_code = 'invalid_grant',
+            last_error = ?,
+            last_error_at = ?,
+            last_error_type = 'invalid_grant',
+            last_error_source = 'oauth',
+            rate_limited_until = NULL,
+            priority = CASE WHEN priority < 99 THEN 99 ELSE priority END,
+            updated_at = ?
+      WHERE id = ? AND provider = 'claude'`
+  ).run('OAuth refresh failed: invalid_grant', nowIso, nowIso, row.id);
+}
+
+function refreshProviderLimitsCache() {
+  if (SELECT_CONNECTION_ID || SKIP_PROVIDER_LIMITS_REFRESH) return null;
+  if (!fs.existsSync(PROVIDER_LIMITS_REFRESH_PATH)) return { ok: false, reason: 'provider limits refresh script missing' };
+  const result = spawnSync(PROVIDER_LIMITS_REFRESH_PATH, [], {
+    cwd: PROJECT,
+    env: { ...process.env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 150 * 1000,
+  });
+  const stdout = result.stdout ? result.stdout.toString('utf8').trim() : '';
+  const stderr = result.stderr ? result.stderr.toString('utf8').trim() : '';
+  const ok = !result.error && result.status === 0;
+  if (!ok && !QUIET) {
+    console.error(JSON.stringify({
+      warning: 'provider limits refresh failed',
+      status: result.status,
+      error: result.error ? result.error.message : null,
+      stdout: stdout.slice(-500),
+      stderr: stderr.slice(-500),
+    }));
+  }
+  return { ok, status: result.status, stdout: stdout.slice(-500), stderr: stderr.slice(-500) };
+}
+
 function selectConnection(db) {
   const fields = 'id, name, access_token, refresh_token, expires_at, scope, provider_specific_data';
   if (SELECT_CONNECTION_ID) {
@@ -258,7 +305,8 @@ function selectConnection(db) {
 }
 
 (async () => {
-  seedLongLivedLimitCache();
+  if (ALLOW_ESTIMATED_LONG_LIVED_QUOTA) seedLongLivedLimitCache();
+  refreshProviderLimitsCache();
   const db = loadDb();
   const { row, selection } = selectConnection(db);
   let accessToken = decrypt(row.access_token);
@@ -282,7 +330,13 @@ function selectConnection(db) {
   } else {
     clearRuntimeEnv();
     if (FORCE || remainingMs < REFRESH_BEFORE_MS || !accessToken || !refreshToken) {
-      const tokens = await refresh(refreshToken);
+      let tokens;
+      try {
+        tokens = await refresh(refreshToken);
+      } catch (err) {
+        markInvalidRefreshToken(db, row, err);
+        throw err;
+      }
       accessToken = tokens.access_token;
       refreshToken = tokens.refresh_token || refreshToken;
       const expiresIn = Number(tokens.expires_in || 28800);

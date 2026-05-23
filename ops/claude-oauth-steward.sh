@@ -14,6 +14,10 @@ log_json() {
 }
 
 seed_long_lived_limits() {
+  case "${CLAUDE_ALLOW_ESTIMATED_LONG_LIVED_QUOTA:-}" in
+    1|true|TRUE|yes|YES|on|ON) ;;
+    *) return 0 ;;
+  esac
   if [ -x "$NODE" ] && [ -f "$LONG_LIVED_LIMITS" ]; then
     "$NODE" "$LONG_LIVED_LIMITS" --quiet >/dev/null 2>&1 || true
   fi
@@ -48,9 +52,16 @@ if pgrep -af '/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe|/a0
 fi
 
 if [ -x "$NODE" ] && [ -f "$SYNC" ]; then
-  "$NODE" "$SYNC" --quiet
+  sync_out=$("$NODE" "$SYNC" --quiet 2>&1)
   rc=$?
+  if [ -n "$sync_out" ]; then
+    printf '%s\n' "$sync_out"
+  fi
   if [ $rc -ne 0 ]; then
+    if printf '%s' "$sync_out" | grep -q 'No quota-eligible OmniRoute Claude connection'; then
+      log_json '{"ok":true,"noEligibleRoute":true,"reason":"no Claude account has fresh real quota above reserves"}'
+      exit 0
+    fi
     log_json "{\"ok\":false,\"syncExitCode\":$rc}"
     exit $rc
   fi
