@@ -65,6 +65,7 @@ const PENDING_CHOICES_FILE = path.join(__dirname, `pending-choices-${BOT_ID}.jso
 const INCOMING_DIR = path.join(__dirname, 'incoming', BOT_ID);
 const RUNS_DIR = path.join(__dirname, `runs-${BOT_ID}`);
 const CURRENT_JOBS_FILE = path.join(__dirname, `current-jobs-${BOT_ID}.json`);
+const MESSAGE_QUEUE_FILE = path.join(__dirname, `message-queue-${BOT_ID}.json`);
 const CLAUDE_RUNNER_PATH = path.join(__dirname, 'claude-runner.js');
 const FULL_ACCESS_TOOLS = [
     'Bash(*)',
@@ -750,6 +751,8 @@ function helpText() {
         '/menu — главное меню\n' +
         '/new — новый диалог (сбросить контекст)\n' +
         '/stop — прервать текущий запрос\n' +
+        '/queue — показать очередь сообщений\n' +
+        '/clearqueue — очистить очередь сообщений\n' +
         '/settings — настройки\n' +
         '/status — статус сессии\n' +
         '/help — помощь';
@@ -767,6 +770,7 @@ function statusText(userId) {
         `• Полный доступ: ${s.fullAccess ? 'да' : 'нет'}\n` +
         `• Веб-поиск: ${s.webSearch ? 'да' : 'нет'}\n` +
         `• Прогресс: ${s.showProgress ? 'да' : 'нет'}\n\n` +
+        queueSummaryText(userId) + '\n\n' +
         currentJobStatusText(userId);
 }
 
@@ -896,6 +900,133 @@ function getCurrentLiveJob(userId) {
     const state = readJobState(jobId);
     if (isJobLive(state)) return { jobId, state };
     return null;
+}
+
+function normalizeMessageQueues(raw) {
+    const out = {};
+    if (!raw || typeof raw !== 'object') return out;
+    for (const [userId, items] of Object.entries(raw)) {
+        if (!Array.isArray(items)) continue;
+        out[userId] = items
+            .filter(item => item && typeof item.prompt === 'string' && item.prompt.trim())
+            .map(item => ({
+                id: item.id || makeQueuedMessageId(),
+                userId: Number(item.userId || userId),
+                chatId: Number(item.chatId || item.userId || userId),
+                prompt: item.prompt,
+                queuedAt: item.queuedAt || new Date().toISOString(),
+                source: item.source || 'message'
+            }));
+    }
+    return out;
+}
+
+function loadMessageQueues() { return normalizeMessageQueues(readJsonFile(MESSAGE_QUEUE_FILE, {})); }
+function saveMessageQueues(queues) { writeJsonAtomic(MESSAGE_QUEUE_FILE, normalizeMessageQueues(queues)); }
+function makeQueuedMessageId() { return `${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`; }
+
+function getQueuedMessages(userId) {
+    const queues = loadMessageQueues();
+    return queues[String(userId)] || [];
+}
+
+function getQueuedMessageCount(userId) { return getQueuedMessages(userId).length; }
+
+function queuePromptForUser(userId, chatId, prompt, source = 'message') {
+    const queues = loadMessageQueues();
+    const key = String(userId);
+    const item = {
+        id: makeQueuedMessageId(),
+        userId,
+        chatId,
+        prompt: String(prompt || ''),
+        queuedAt: new Date().toISOString(),
+        source
+    };
+    if (!queues[key]) queues[key] = [];
+    queues[key].push(item);
+    saveMessageQueues(queues);
+    return { item, position: queues[key].length, total: queues[key].length };
+}
+
+function peekQueuedPromptForUser(userId) {
+    return getQueuedMessages(userId)[0] || null;
+}
+
+function removeQueuedPromptForUser(userId, itemId) {
+    const queues = loadMessageQueues();
+    const key = String(userId);
+    const items = queues[key] || [];
+    const next = items.filter(item => item.id !== itemId);
+    if (next.length) queues[key] = next; else delete queues[key];
+    saveMessageQueues(queues);
+    return { removed: next.length !== items.length, remaining: next.length };
+}
+
+function clearQueuedPromptsForUser(userId) {
+    const queues = loadMessageQueues();
+    const key = String(userId);
+    const count = (queues[key] || []).length;
+    delete queues[key];
+    saveMessageQueues(queues);
+    return count;
+}
+
+function queuedPromptPreview(prompt) {
+    return String(prompt || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+}
+
+function queueStatusText(userId) {
+    const items = getQueuedMessages(userId);
+    if (!items.length) return '🧾 Очередь: пусто';
+    const lines = [`🧾 Очередь: ${items.length}`];
+    for (const [i, item] of items.slice(0, 5).entries()) {
+        lines.push(`${i + 1}. ${queuedPromptPreview(item.prompt) || '(без текста)'}`);
+    }
+    if (items.length > 5) lines.push(`… ещё ${items.length - 5}`);
+    return lines.join('\n');
+}
+
+function queueSummaryText(userId) {
+    const count = getQueuedMessageCount(userId);
+    return count ? `🧾 Очередь: ${count}` : '🧾 Очередь: пусто';
+}
+
+const activeMessageQueueDrains = new Set();
+function scheduleQueuedMessageDrain(userId, fallbackChatId = null) {
+    const key = String(userId);
+    if (activeMessageQueueDrains.has(key)) return;
+    activeMessageQueueDrains.add(key);
+    const timer = setTimeout(async () => {
+        try {
+            await enqueueForUser(userId, async () => {
+                if (getCurrentLiveJob(userId)) return;
+                const item = peekQueuedPromptForUser(userId);
+                if (!item) return;
+                const chatId = item.chatId || fallbackChatId;
+                if (!chatId) return;
+                const remainingBefore = Math.max(0, getQueuedMessageCount(userId) - 1);
+                await bot.sendMessage(
+                    chatId,
+                    `▶ Запускаю следующее сообщение из очереди. Осталось после него: ${remainingBefore}.`
+                ).catch(() => {});
+                const result = await processUserMessage(userId, chatId, item.prompt, { fromQueue: true, queueItemId: item.id });
+                if (result && result.started) removeQueuedPromptForUser(userId, item.id);
+            });
+        } catch (err) {
+            log('message queue drain error for', userId, err.message);
+        } finally {
+            activeMessageQueueDrains.delete(key);
+        }
+    }, 500);
+    timer.unref();
+}
+
+function recoverQueuedMessages() {
+    const queues = loadMessageQueues();
+    for (const userId of Object.keys(queues)) {
+        if ((queues[userId] || []).length) scheduleQueuedMessageDrain(Number(userId));
+    }
 }
 
 function formatAge(iso) {
@@ -1389,6 +1520,7 @@ function startJobMonitor(jobId, options = {}) {
         } finally {
             clearCurrentJob(userId, jobId);
             activeJobMonitors.delete(jobId);
+            scheduleQueuedMessageDrain(userId, chatId);
         }
     }
 
@@ -1539,6 +1671,12 @@ bot.on('message', async (msg) => {
                 { reply_markup: settingsMenuKeyboard(getUserSettings(userId)) }); return;
         }
         if (msg.text === '/status') { bot.sendMessage(chatId, statusText(userId), { parse_mode: 'Markdown' }); return; }
+        if (msg.text === '/queue') { bot.sendMessage(chatId, queueStatusText(userId)); return; }
+        if (msg.text === '/clearqueue') {
+            const removed = clearQueuedPromptsForUser(userId);
+            bot.sendMessage(chatId, removed ? `✓ Очередь очищена: ${removed}` : 'Очередь уже пустая.');
+            return;
+        }
         if (msg.text === '/help')   { bot.sendMessage(chatId, helpText(), { parse_mode: 'Markdown' }); return; }
     }
 
@@ -1607,19 +1745,22 @@ bot.on('message', async (msg) => {
     b.timer = setTimeout(() => flushUserTextBatch(userId), TEXT_BATCH_FLUSH_MS);
 });
 
-async function processUserMessage(userId, chatId, prompt) {
+async function processUserMessage(userId, chatId, prompt, options = {}) {
     const current = getCurrentLiveJob(userId);
     if (current) {
+        if (options.fromQueue) return { started: false, busy: true };
+        const queued = queuePromptForUser(userId, chatId, prompt, options.source || 'message');
         const state = current.state;
         await bot.sendMessage(
             chatId,
-            `⏳ Уже выполняется job \`${current.jobId}\`.\n` +
-            `Статус: \`${state.status || 'running'}\`\n` +
-            `Последняя активность: ${formatAge(state.lastActivityAt)} назад\n\n` +
-            'Напиши /status, чтобы посмотреть детали, или /stop, чтобы прервать.',
-            { parse_mode: 'Markdown' }
+            '📥 Сообщение поставлено в очередь.\n' +
+            `Позиция: ${queued.position}.\n` +
+            `Сейчас выполняется job ${current.jobId}.\n` +
+            `Статус: ${state.status || 'running'}.\n` +
+            `Последняя активность: ${formatAge(state.lastActivityAt)} назад.\n\n` +
+            'После ответа я автоматически запущу следующее сообщение. /queue — посмотреть очередь, /clearqueue — очистить.'
         ).catch(() => {});
-        return;
+        return { started: false, queued: true, queueItemId: queued.item.id };
     }
 
     const startTs = Date.now();
@@ -1644,6 +1785,7 @@ async function processUserMessage(userId, chatId, prompt) {
         const jobId = startClaudeJob(userId, chatId, fullPrompt, settings, useResume ? existingSession : null);
         log(`job ${jobId} started for ${userId} in ${Math.round((Date.now() - startTs) / 1000)}s`);
         startJobMonitor(jobId, { statusMsgId, replayFromStart: true });
+        return { started: true, jobId };
     } catch (err) {
         if (statusMsgId) {
             try {
@@ -1655,6 +1797,7 @@ async function processUserMessage(userId, chatId, prompt) {
         }
         log(`job create ERROR for ${userId}:`, err.message);
         await bot.sendMessage(chatId, '⚠ Не удалось запустить задачу:\n' + String(err.message || err)).catch(() => {});
+        return { started: false, error: err };
     }
 }
 
@@ -2012,6 +2155,8 @@ bot.setMyCommands([
     { command: 'menu', description: 'Главное меню' },
     { command: 'new', description: 'Новый диалог (сбросить контекст)' },
     { command: 'stop', description: 'Прервать текущий запрос' },
+    { command: 'queue', description: 'Очередь сообщений' },
+    { command: 'clearqueue', description: 'Очистить очередь' },
     { command: 'settings', description: 'Настройки' },
     { command: 'status', description: 'Статус сессии' },
     { command: 'help', description: 'Помощь' }
@@ -2026,5 +2171,7 @@ console.log('Sessions file:  ', SESSIONS_FILE);
 console.log('Settings file:  ', SETTINGS_FILE);
 console.log('Incoming dir:   ', INCOMING_DIR);
 console.log('Runs dir:       ', RUNS_DIR);
+console.log('Message queue: ', MESSAGE_QUEUE_FILE);
 recoverActiveJobs();
+recoverQueuedMessages();
 console.log('Polling Telegram...');
