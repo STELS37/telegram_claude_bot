@@ -339,7 +339,19 @@ function blockingWindows(account) {
         .filter((status) => status && status.thresholdReached);
 }
 
+function externalBlockIso(account) {
+    if (!account || !account.externallyRateLimited) return null;
+    const reasons = Array.isArray(account.reasons) ? account.reasons : [];
+    for (const reason of reasons) {
+        const match = String(reason || '').match(/until\s+([^\s]+)$/i);
+        if (match && Number.isFinite(new Date(match[1]).getTime())) return match[1];
+    }
+    return account.blockUntil || null;
+}
+
 function availabilityFromBlockingWindows(account) {
+    const externalIso = externalBlockIso(account);
+    if (externalIso) return { iso: externalIso, source: 'auth/cooldown' };
     const blockers = blockingWindows(account);
     const resetTimes = blockers
         .map((status) => ({ status, ms: status.resetAt ? new Date(status.resetAt).getTime() : null }))
@@ -366,16 +378,33 @@ function quotaStatusText(status) {
 function availabilityLine(account) {
     const availability = availabilityFromBlockingWindows(account);
     const availableAt = formatFutureMoscowTime(availability.iso);
-    return availableAt || 'после обновления лимитов';
+    if (!availableAt) return 'после обновления лимитов';
+    if (availability.source === 'auth/cooldown') return 'после проверки авторизации: ' + availableAt;
+    return availableAt;
+}
+
+function readableNonQuotaReason(reason) {
+    const text = String(reason || '');
+    if (/external rate limit until/i.test(text)) return 'маршрут временно заблокирован после ошибки авторизации';
+    if (/token expires at/i.test(text)) return 'OAuth-токен истёк или требует refresh';
+    if (/missing refresh token/i.test(text)) return 'нет refresh token';
+    if (/missing access token/i.test(text)) return 'нет access token';
+    return text;
 }
 
 function blockerText(account) {
     const blockers = blockingWindows(account);
-    if (!blockers.length) return 'ниже резерва';
-    return blockers.map((status) => {
+    const parts = blockers.map((status) => {
         const label = quotaWindowLabel(status.window) === '5ч' ? '5 часов' : '7 дней';
         return label + ': ' + quotaStatusText(status);
-    }).join(', ');
+    });
+    const reasons = Array.isArray(account && account.reasons) ? account.reasons : [];
+    for (const reason of reasons) {
+        if (/remaining\s+\d/i.test(String(reason || ''))) continue;
+        const readable = readableNonQuotaReason(reason);
+        if (readable && !parts.includes(readable)) parts.push(readable);
+    }
+    return parts.length ? parts.join('; ') : 'нет точной причины, нужен refresh лимитов';
 }
 
 function freshnessText(account) {
@@ -389,16 +418,20 @@ function accountReserveLine(account) {
     return '5ч ' + percentText(account.session && account.session.remaining) + '%, 7д ' + percentText(account.weekly && account.weekly.remaining) + '%';
 }
 
-function buildAccountLine(account, index) {
-    const stale = blockingWindows(account).some((status) => {
-        const ms = Date.now() - new Date(status.snapshotAt || 0).getTime();
+function hasStaleQuotaData(account) {
+    return [account && account.session, account && account.weekly].some((status) => {
+        const ms = Date.now() - new Date(status && status.snapshotAt || 0).getTime();
         return Number.isFinite(ms) && ms > 20 * 60 * 1000;
     });
+}
+
+function buildAccountLine(account, index) {
+    const stale = hasStaleQuotaData(account);
     return [
         String(index + 1) + '. ' + shortAccountName(account) + ' — ' + availabilityLine(account),
         '   Остаток: ' + accountReserveLine(account) + '.',
         '   Не проходит: ' + blockerText(account) + '.',
-        stale ? '   Данные по этому аккаунту старые, OmniRoute обновит их отдельно.' : null
+        stale ? '   Данные лимитов старые; причина блокировки может быть не в лимитах.' : null
     ].filter(Boolean).join('\n');
 }
 
@@ -435,21 +468,23 @@ function buildOmniRouteQuotaStatusMessage() {
             const bb = availabilityFromBlockingWindows(b).iso;
             const at = aa ? new Date(aa).getTime() : Number.MAX_SAFE_INTEGER;
             const bt = bb ? new Date(bb).getTime() : Number.MAX_SAFE_INTEGER;
-            if (at !== bt) return at - bt;
+            if (Math.abs(at - bt) > 5 * 60 * 1000) return at - bt;
             return (b.score || 0) - (a.score || 0);
         });
 
     const next = accounts[0] || null;
+    const nextAvailability = next ? availabilityFromBlockingWindows(next) : null;
+    const nextIsAuthCooldown = nextAvailability && nextAvailability.source === 'auth/cooldown';
     const nextLines = next
         ? [
-            'Ближайший запуск Opus 4.7:',
+            nextIsAuthCooldown ? 'Ближайшая повторная проверка Claude-маршрута:' : 'Ближайший запуск Opus 4.7:',
             shortAccountName(next) + ' — ' + availabilityLine(next) + '.',
-            'Сейчас: ' + accountReserveLine(next) + '. Не хватает: ' + blockerText(next) + '.'
+            'Сейчас: ' + accountReserveLine(next) + '. ' + (nextIsAuthCooldown ? 'Причина блокировки: ' : 'Не хватает: ') + blockerText(next) + '.'
         ]
         : ['Ближайший запуск Opus 4.7: нет данных.'];
 
     return [
-        'Сейчас Opus 4.7 запускать нельзя: все Claude-аккаунты ниже резерва.',
+        'Сейчас Opus 4.7 запускать нельзя: нет Claude-маршрута выше резервов и без блокировок.',
         '',
         ...nextLines,
         '',
