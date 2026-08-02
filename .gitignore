@@ -22,3 +22,10 @@ config-main.json
 config-parallel.json
 config.json
 *.local.json
+
+# Конфиги параллельных ботов 3..6 создаются локально и содержат БОЕВОЙ telegramToken
+# (проверено 02.08.2026: -3 и -4 хранят реальные токены, режим 600). Репозиторий публичный
+# (github.com/STELS37/telegram_claude_bot), поэтому они должны быть недостижимы для `git add -A`.
+# config-linux.json и config-linux-parallel.json остаются в индексе как шаблоны с PASTE_-заглушкой;
+# рабочий токен всё равно приходит из /etc/claude-telegram-bot*.env (bot.js:39 перекрывает конфиг).
+config-linux-parallel-[0-9]*.json
